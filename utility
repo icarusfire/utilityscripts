@@ -1,0 +1,8 @@
+    - script: |
+        echo "Using run ID: $(resources.pipeline.ReleaseNotes.runId)"
+        echo "Published run name: $(resources.pipeline.ReleaseNotes.runName)"
+        echo "Available artifacts:"
+        az artifacts universal list \
+          --scope build \
+          --name drop \
+          --build-id $(resources.pipeline.ReleaseNotes.runId)
