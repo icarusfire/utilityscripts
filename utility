@@ -1,21 +1,91 @@
-- bash: |
-    set -euo pipefail
+trigger: none                # remove if you already have a trigger
+pool:
+  vmImage: 'ubuntu-latest'
 
-    ROOT="$(Pipeline.Workspace)/ReleaseNotes/ReleaseNotesKansCHG"
-    RELEASE_DIR="$(find "$ROOT" -maxdepth 1 -mindepth 1 -type d | head -n1)"
-    RELEASE_NUMBER="$(basename "$RELEASE_DIR" | cut -d' ' -f1)"
+##############################################################################
+# JOB 1 – build the text and publish the variables (all in Python)           #
+##############################################################################
+jobs:
+- job: build
+  displayName: Build release notes + variables
+  steps:
+  # (optional) pick a Python version
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.x'
 
-    # read files
-    ALL_TEXT="$(< "$RELEASE_DIR/${RELEASE_NUMBER}_all.txt")"
-    NOTES_TEXT="$(< "$ROOT/RELEASE_NOTES.md")"
+  - task: PythonScript@0
+    name: setNotes                         # <- task name; needed for output vars
+    displayName: Build release notes
+    inputs:
+      scriptSource: inline
+      script: |
+        import os, pathlib, sys
 
-    # set pipeline variables
-    echo "##vso[task.setvariable variable=releaseNumber]$RELEASE_NUMBER"
-    echo "##vso[task.setvariable variable=shortDescription]Welcome to release $RELEASE_NUMBER"
-    # join with a blank line in between
-    COMBINED="$(printf "%s\n\n%s" "$NOTES_TEXT" "$ALL_TEXT")"
-    # if your combined text is large, consider writing to a file or use multiline vars carefully
-    echo "##vso[task.setvariable variable=description]$COMBINED"
-  name: setVars
-  displayName: Extract and Set Variables
-  shell: bash
+        # ------------------------------------------------------------------ #
+        # 1. Collect the files                                               #
+        root = pathlib.Path(os.environ['PIPELINE_WORKSPACE']) \
+               / 'ReleaseNotes' / 'ReleaseNotesKansCHG'
+        release_dir = next(p for p in root.iterdir() if p.is_dir())
+        release_number = release_dir.name.split(' ')[0]
+
+        text = ((root / 'RELEASE_NOTES.md').read_text() +
+                '\n\n' +
+                (release_dir / f'{release_number}_all.txt').read_text())
+
+        # ------------------------------------------------------------------ #
+        # 2. Escape newlines for Azure (see MS-docs)                         #
+        def azp_escape(s: str) -> str:
+            return (s.replace('%', '%25')
+                     .replace('\r', '%0D')
+                     .replace('\n', '%0A'))
+
+        safe = azp_escape(text)
+
+        # ------------------------------------------------------------------ #
+        # 3. Publish the three variables                                     #
+        print(f'##vso[task.setvariable variable=releaseNumber]{release_number}')
+        print(f'##vso[task.setvariable variable=shortDescription]'
+              f'Welcome to release {release_number}')
+        # isOutput=true makes it visible to other jobs
+        print(f'##vso[task.setvariable variable=descriptionEsc;isOutput=true]{safe}')
+
+  # ── optional: prove it round-trips inside the same job ─────────────────── #
+  - task: PythonScript@0
+    displayName: Show long text (same job)
+    inputs:
+      scriptSource: inline
+      script: |
+        import os, textwrap
+        esc = os.environ['DESCRIPTION_ESC']
+        dec = (esc.replace('%0A', '\n')
+                   .replace('%0D', '\r')
+                   .replace('%25', '%'))
+        print(textwrap.indent(dec, '  > '))
+    env:
+      DESCRIPTION_ESC: $(descriptionEsc)
+
+##############################################################################
+# JOB 2 – completely separate job that consumes the variable                 #
+##############################################################################
+- job: consume
+  displayName: Use the variable in another job
+  dependsOn: build
+  variables:
+    # pull the output var produced by task 'setNotes' in the previous job
+    descriptionEsc: $[ dependencies.build.outputs['setNotes.descriptionEsc'] ]
+  steps:
+  - task: PythonScript@0
+    displayName: Decode + print in a different job
+    inputs:
+      scriptSource: inline
+      script: |
+        import os, textwrap
+        esc = os.environ['DESCRIPTION_ESC']
+        dec = (esc.replace('%0A', '\n')
+                   .replace('%0D', '\r')
+                   .replace('%25', '%'))
+        print('----- full release text -----')
+        print(textwrap.indent(dec, '  '))
+    env:
+      DESCRIPTION_ESC: $(descriptionEsc)
