@@ -3,60 +3,67 @@ pool:
   vmImage: ubuntu-latest
 
 steps:
-# ──────────────────────────────────────────────────────────────────────────────
-# 1) Pick a Python runtime
+#───────────────────────────────────────────────────────────────────────────────
+# 1) Select Python
 - task: UsePythonVersion@0
   inputs:
     versionSpec: '3.x'
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 2) Read files, build the text, percent-escape newlines, publish variables
+#───────────────────────────────────────────────────────────────────────────────
+# 2) Read, combine, manually escape only %, CR, LF, and publish variables
 - task: PythonScript@0
   name: setNotes
-  displayName: Build and escape release notes
+  displayName: Build & escape release notes
   inputs:
     scriptSource: inline
     script: |
-      import os, pathlib, urllib.parse
+      import os, pathlib
 
-      # locate your folder and files
-      ws = os.getenv('PIPELINE_WORKSPACE')
+      # locate your workspace files
+      ws   = os.getenv('PIPELINE_WORKSPACE')
       root = pathlib.Path(ws) / 'ReleaseNotes' / 'ReleaseNotesKansCHG'
-      rel_dir = next(p for p in root.iterdir() if p.is_dir())
+      rel_dir = next(d for d in root.iterdir() if d.is_dir())
       rel_num = rel_dir.name.split(' ')[0]
 
-      # read and combine
+      # read + combine
       notes   = (root / 'RELEASE_NOTES.md').read_text()
       all_txt = (rel_dir / f'{rel_num}_all.txt').read_text()
       combined = notes + '\n\n' + all_txt
 
-      # percent-encode EVERYTHING, including \n → %0A, \r → %0D, % → %25
-      safe = urllib.parse.quote(combined, safe='')
+      # manual Azure escape: only %, CR, LF
+      safe = (combined
+              .replace('%', '%25')
+              .replace('\r', '%0D')
+              .replace('\n', '%0A'))
 
-      # publish three variables
-      print(f"##vso[task.setvariable variable=releaseNumber;]{rel_num}")
-      print(f"##vso[task.setvariable variable=shortDescription;]Welcome to release {rel_num}")
-      print(f"##vso[task.setvariable variable=descriptionEsc;]{safe}")
+      # publish pipeline variables
+      print(f"##vso[task.setvariable variable=releaseNumber]{rel_num}")
+      print(f"##vso[task.setvariable variable=shortDescription]Welcome to release {rel_num}")
+      print(f"##vso[task.setvariable variable=descriptionEsc]{safe}")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 3) (Optional) Verify that at runtime you really DO get the multi-line text
+#───────────────────────────────────────────────────────────────────────────────
+# 3) (Optional) Verify at runtime that you really get multi-line text back
 - task: PythonScript@0
-  displayName: Verify descriptionEsc decoded
+  displayName: Decode & verify descriptionEsc
+  env:
+    DESCRIPTION_ESC: $(descriptionEsc)
   inputs:
     scriptSource: inline
     script: |
       import os, textwrap
-      esc = os.getenv('descriptionEsc')
-      # reverse the URL-encoding
-      dec = esc.replace('%0A','\n').replace('%0D','\r').replace('%25','%')
+      esc = os.getenv('DESCRIPTION_ESC')
+      # reverse only the three Azure escapes
+      dec = (esc
+             .replace('%0A', '\n')
+             .replace('%0D', '\r')
+             .replace('%25', '%'))
       print('--- decoded release text ---')
       print(textwrap.indent(dec, '  '))
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 4) Any downstream task can now take $(descriptionEsc) as an input and
-#    the agent will have already un-escaped %0A → newline for you. Example:
+#───────────────────────────────────────────────────────────────────────────────
+# 4) Any downstream task—custom or built-in—can now accept $(descriptionEsc)
 - task: MyCustomTask@1
-  displayName: Consume the full release notes
+  displayName: Consume full release notes
   inputs:
     releaseNumber: $(releaseNumber)
     title:         $(shortDescription)
