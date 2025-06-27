@@ -1,42 +1,21 @@
-    - bash: |
-        set -euo pipefail
+- bash: |
+    set -euo pipefail
 
-        # 1. point at the root of your downloaded artifacts
-        ROOT="$(Pipeline.Workspace)/ReleaseNotes/ReleaseNotesKansCHG"
-        echo "Artifact root: $ROOT"
+    ROOT="$(Pipeline.Workspace)/ReleaseNotes/ReleaseNotesKansCHG"
+    RELEASE_DIR="$(find "$ROOT" -maxdepth 1 -mindepth 1 -type d | head -n1)"
+    RELEASE_NUMBER="$(basename "$RELEASE_DIR" | cut -d' ' -f1)"
 
-        # 2. find the one subfolder (e.g. "5.145 KANS_CHG")
-        RELEASE_DIR="$(find "$ROOT" -maxdepth 1 -mindepth 1 -type d | head -n1)"
-        echo "Full release folder: $RELEASE_DIR"
+    # read files
+    ALL_TEXT="$(< "$RELEASE_DIR/${RELEASE_NUMBER}_all.txt")"
+    NOTES_TEXT="$(< "$ROOT/RELEASE_NOTES.md")"
 
-        # 3. extract just the number (before the first space)
-        RELEASE_NUMBER="$(basename "$RELEASE_DIR" | cut -d' ' -f1)"
-        echo "RELEASE_NUMBER = $RELEASE_NUMBER"
-
-        # 4. point at the two files you need
-        ALL_FILE="$RELEASE_DIR/${RELEASE_NUMBER}_all.txt"
-        NOTES_FILE="$ROOT/RELEASE_NOTES.md"
-
-        # 5. sanity-check existence
-        [[ -f "$ALL_FILE"  ]] || { echo "✖ $ALL_FILE not found"; exit 1; }
-        [[ -f "$NOTES_FILE" ]] || { echo "✖ $NOTES_FILE not found"; exit 1; }
-
-        # 6. slurp into shell variables
-        ALL_TEXT="$(< "$ALL_FILE")"
-        NOTES_TEXT="$(< "$NOTES_FILE")"
-
-        # 7. echo everything
-        echo
-        echo "===== RELEASE_NUMBER ====="
-        echo "$RELEASE_NUMBER"
-        echo
-        echo "===== $RELEASE_NUMBER_all.txt ====="
-        echo "$ALL_TEXT"
-        echo
-        echo "===== RELEASE_NOTES.md ====="
-        echo "$NOTES_TEXT"
-      displayName: 'Extract RELEASE_NUMBER & files'
-      workingDirectory: $(Pipeline.Workspace)
-      shell: bash
-
-
+    # set pipeline variables
+    echo "##vso[task.setvariable variable=releaseNumber]$RELEASE_NUMBER"
+    echo "##vso[task.setvariable variable=shortDescription]Welcome to release $RELEASE_NUMBER"
+    # join with a blank line in between
+    COMBINED="$(printf "%s\n\n%s" "$NOTES_TEXT" "$ALL_TEXT")"
+    # if your combined text is large, consider writing to a file or use multiline vars carefully
+    echo "##vso[task.setvariable variable=description]$COMBINED"
+  name: setVars
+  displayName: Extract and Set Variables
+  shell: bash
