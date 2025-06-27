@@ -1,91 +1,63 @@
-trigger: none                # remove if you already have a trigger
+trigger: none
 pool:
-  vmImage: 'ubuntu-latest'
+  vmImage: ubuntu-latest
 
-##############################################################################
-# JOB 1 – build the text and publish the variables (all in Python)           #
-##############################################################################
-jobs:
-- job: build
-  displayName: Build release notes + variables
-  steps:
-  # (optional) pick a Python version
-  - task: UsePythonVersion@0
-    inputs:
-      versionSpec: '3.x'
+steps:
+# ──────────────────────────────────────────────────────────────────────────────
+# 1) Pick a Python runtime
+- task: UsePythonVersion@0
+  inputs:
+    versionSpec: '3.x'
 
-  - task: PythonScript@0
-    name: setNotes                         # <- task name; needed for output vars
-    displayName: Build release notes
-    inputs:
-      scriptSource: inline
-      script: |
-        import os, pathlib, sys
+# ──────────────────────────────────────────────────────────────────────────────
+# 2) Read files, build the text, percent-escape newlines, publish variables
+- task: PythonScript@0
+  name: setNotes
+  displayName: Build and escape release notes
+  inputs:
+    scriptSource: inline
+    script: |
+      import os, pathlib, urllib.parse
 
-        # ------------------------------------------------------------------ #
-        # 1. Collect the files                                               #
-        root = pathlib.Path(os.environ['PIPELINE_WORKSPACE']) \
-               / 'ReleaseNotes' / 'ReleaseNotesKansCHG'
-        release_dir = next(p for p in root.iterdir() if p.is_dir())
-        release_number = release_dir.name.split(' ')[0]
+      # locate your folder and files
+      ws = os.getenv('PIPELINE_WORKSPACE')
+      root = pathlib.Path(ws) / 'ReleaseNotes' / 'ReleaseNotesKansCHG'
+      rel_dir = next(p for p in root.iterdir() if p.is_dir())
+      rel_num = rel_dir.name.split(' ')[0]
 
-        text = ((root / 'RELEASE_NOTES.md').read_text() +
-                '\n\n' +
-                (release_dir / f'{release_number}_all.txt').read_text())
+      # read and combine
+      notes   = (root / 'RELEASE_NOTES.md').read_text()
+      all_txt = (rel_dir / f'{rel_num}_all.txt').read_text()
+      combined = notes + '\n\n' + all_txt
 
-        # ------------------------------------------------------------------ #
-        # 2. Escape newlines for Azure (see MS-docs)                         #
-        def azp_escape(s: str) -> str:
-            return (s.replace('%', '%25')
-                     .replace('\r', '%0D')
-                     .replace('\n', '%0A'))
+      # percent-encode EVERYTHING, including \n → %0A, \r → %0D, % → %25
+      safe = urllib.parse.quote(combined, safe='')
 
-        safe = azp_escape(text)
+      # publish three variables
+      print(f"##vso[task.setvariable variable=releaseNumber;]{rel_num}")
+      print(f"##vso[task.setvariable variable=shortDescription;]Welcome to release {rel_num}")
+      print(f"##vso[task.setvariable variable=descriptionEsc;]{safe}")
 
-        # ------------------------------------------------------------------ #
-        # 3. Publish the three variables                                     #
-        print(f'##vso[task.setvariable variable=releaseNumber]{release_number}')
-        print(f'##vso[task.setvariable variable=shortDescription]'
-              f'Welcome to release {release_number}')
-        # isOutput=true makes it visible to other jobs
-        print(f'##vso[task.setvariable variable=descriptionEsc;isOutput=true]{safe}')
+# ──────────────────────────────────────────────────────────────────────────────
+# 3) (Optional) Verify that at runtime you really DO get the multi-line text
+- task: PythonScript@0
+  displayName: Verify descriptionEsc decoded
+  inputs:
+    scriptSource: inline
+    script: |
+      import os, textwrap
+      esc = os.getenv('descriptionEsc')
+      # reverse the URL-encoding
+      dec = esc.replace('%0A','\n').replace('%0D','\r').replace('%25','%')
+      print('--- decoded release text ---')
+      print(textwrap.indent(dec, '  '))
 
-  # ── optional: prove it round-trips inside the same job ─────────────────── #
-  - task: PythonScript@0
-    displayName: Show long text (same job)
-    inputs:
-      scriptSource: inline
-      script: |
-        import os, textwrap
-        esc = os.environ['DESCRIPTION_ESC']
-        dec = (esc.replace('%0A', '\n')
-                   .replace('%0D', '\r')
-                   .replace('%25', '%'))
-        print(textwrap.indent(dec, '  > '))
-    env:
-      DESCRIPTION_ESC: $(descriptionEsc)
-
-##############################################################################
-# JOB 2 – completely separate job that consumes the variable                 #
-##############################################################################
-- job: consume
-  displayName: Use the variable in another job
-  dependsOn: build
-  variables:
-    # pull the output var produced by task 'setNotes' in the previous job
-    descriptionEsc: $[ dependencies.build.outputs['setNotes.descriptionEsc'] ]
-  steps:
-  - task: PythonScript@0
-    displayName: Decode + print in a different job
-    inputs:
-      scriptSource: inline
-      script: |
-        import os, textwrap
-        esc = os.environ['DESCRIPTION_ESC']
-        dec = (esc.replace('%0A', '\n')
-                   .replace('%0D', '\r')
-                   .replace('%25', '%'))
-        print('----- full release text -----')
-        print(textwrap.indent(dec, '  '))
-    env:
-      DESCRIPTION_ESC: $(descriptionEsc)
+# ──────────────────────────────────────────────────────────────────────────────
+# 4) Any downstream task can now take $(descriptionEsc) as an input and
+#    the agent will have already un-escaped %0A → newline for you. Example:
+- task: MyCustomTask@1
+  displayName: Consume the full release notes
+  inputs:
+    releaseNumber: $(releaseNumber)
+    title:         $(shortDescription)
+    fullNotes:     $(descriptionEsc)
