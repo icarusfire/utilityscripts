@@ -1,43 +1,69 @@
-from datetime import datetime, timedelta, time
+# file: grafana_time_link.py
+import datetime as dt
+import re
+from zoneinfo import ZoneInfo        # Python ≥ 3.9
 
-def next_week_targets(today=None):
+# --- CONFIG ---------------------------------------------------------------
+TEMPLATE_URL = (
+    "https://myurl/explore?...from%22%3A%221751298600000%22%2C%22to%22%3A%221751298660000%22..."
+    "&orgId=1"
+)
+TZ_NL = ZoneInfo("Europe/Amsterdam")
+_RANGE_REGEX = re.compile(r"from%22%3A%22\d+%22%2C%22to%22%3A%22\d+%22")
+# --------------------------------------------------------------------------
+
+def make_link(base_url: str = TEMPLATE_URL,
+              when: dt.datetime | None = None) -> str:
     """
-    Return next week's Thursday 06:00 UTC and Friday 12:00 UTC
-    as ('mm-dd-YYYY HH:MM:SS', 'mm-dd-YYYY HH:MM:SS').
+    Replace the 'from' and 'to' epoch values in `base_url` with a single
+    timestamp (millis since epoch).  `from` and `to` become identical.
+
+    Parameters
+    ----------
+    base_url : str
+        Grafana URL that already contains a 'range' JSON block.
+    when : datetime.datetime | None
+        Moment that becomes the new `from` AND `to`.
+        Defaults to 'now' in Europe/Amsterdam.
+
+    Returns
+    -------
+    str
+        URL with fresh, zero-width time range.
     """
-    if today is None:
-        today = datetime.utcnow().date()
+    if when is None:
+        when = dt.datetime.now(TZ_NL)
 
-    this_monday   = today - timedelta(days=today.weekday())   # Monday of current week
-    next_monday   = this_monday + timedelta(days=7)           # Monday of *next* week
-    thursday_utc  = datetime.combine(next_monday + timedelta(days=3), time(6,  0, 0))
-    friday_utc    = datetime.combine(next_monday + timedelta(days=4), time(12, 0, 0))
-    fmt = "%m-%d-%Y %H:%M:%S"
-    return thursday_utc.strftime(fmt), friday_utc.strftime(fmt)
+    epoch_ms = int(when.timestamp() * 1000)
 
+    replacement = (
+        f"from%22%3A%22{epoch_ms}%22%2C%22to%22%3A%22{epoch_ms}%22"
+    )
+    return _RANGE_REGEX.sub(replacement, base_url)
 
-import unittest, datetime as dt
-class TestNextWeekTargets(unittest.TestCase):
-    def test_example(self):
-        self.assertEqual(
-            next_week_targets(dt.date(2025, 7, 3)),
-            ("07-10-2025 06:00:00", "07-11-2025 12:00:00")
-        )
-    def test_year_boundary(self):
-        self.assertEqual(
-            next_week_targets(dt.date(2024, 12, 31)),
-            ("01-09-2025 06:00:00", "01-10-2025 12:00:00")
-        )
-    def test_february(self):
-        self.assertEqual(
-            next_week_targets(dt.date(2025, 2, 28)),
-            ("03-06-2025 06:00:00", "03-07-2025 12:00:00")
-        )
-    def test_leap_year(self):
-        self.assertEqual(
-            next_week_targets(dt.date(2024, 2, 29)),
-            ("03-07-2024 06:00:00", "03-08-2024 12:00:00")
-        )
 
 if __name__ == "__main__":
-    unittest.main()
+    print(make_link())          # manual smoke-test
+
+
+
+
+# file: test_grafana_time_link.py
+import datetime as dt
+from zoneinfo import ZoneInfo
+import re
+import grafana_time_link as gl
+
+def test_zero_window():
+    tz = ZoneInfo("Europe/Amsterdam")
+    fixed = dt.datetime(2025, 6, 30, 17, 50, tzinfo=tz)   # 15:50 UTC
+    url = gl.make_link(when=fixed)
+
+    # extract the two numbers
+    m = re.search(r"from%22%3A%22(\d+)%22%2C%22to%22%3A%22(\d+)%22", url)
+    assert m, "'range' block missing"
+    f_ms, t_ms = map(int, m.groups())
+
+    # both must be identical
+    assert f_ms == t_ms == 1751298600000
+
