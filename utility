@@ -1,70 +1,43 @@
-trigger: none
-pool:
-  vmImage: ubuntu-latest
+from datetime import datetime, timedelta, time
 
-steps:
-#───────────────────────────────────────────────────────────────────────────────
-# 1) Select Python
-- task: UsePythonVersion@0
-  inputs:
-    versionSpec: '3.x'
+def next_week_targets(today=None):
+    """
+    Return next week's Thursday 06:00 UTC and Friday 12:00 UTC
+    as ('mm-dd-YYYY HH:MM:SS', 'mm-dd-YYYY HH:MM:SS').
+    """
+    if today is None:
+        today = datetime.utcnow().date()
 
-#───────────────────────────────────────────────────────────────────────────────
-# 2) Read, combine, manually escape only %, CR, LF, and publish variables
-- task: PythonScript@0
-  name: setNotes
-  displayName: Build & escape release notes
-  inputs:
-    scriptSource: inline
-    script: |
-      import os, pathlib
+    this_monday   = today - timedelta(days=today.weekday())   # Monday of current week
+    next_monday   = this_monday + timedelta(days=7)           # Monday of *next* week
+    thursday_utc  = datetime.combine(next_monday + timedelta(days=3), time(6,  0, 0))
+    friday_utc    = datetime.combine(next_monday + timedelta(days=4), time(12, 0, 0))
+    fmt = "%m-%d-%Y %H:%M:%S"
+    return thursday_utc.strftime(fmt), friday_utc.strftime(fmt)
 
-      # locate your workspace files
-      ws   = os.getenv('PIPELINE_WORKSPACE')
-      root = pathlib.Path(ws) / 'ReleaseNotes' / 'ReleaseNotesKansCHG'
-      rel_dir = next(d for d in root.iterdir() if d.is_dir())
-      rel_num = rel_dir.name.split(' ')[0]
 
-      # read + combine
-      notes   = (root / 'RELEASE_NOTES.md').read_text()
-      all_txt = (rel_dir / f'{rel_num}_all.txt').read_text()
-      combined = notes + '\n\n' + all_txt
+import unittest, datetime as dt
+class TestNextWeekTargets(unittest.TestCase):
+    def test_example(self):
+        self.assertEqual(
+            next_week_targets(dt.date(2025, 7, 3)),
+            ("07-10-2025 06:00:00", "07-11-2025 12:00:00")
+        )
+    def test_year_boundary(self):
+        self.assertEqual(
+            next_week_targets(dt.date(2024, 12, 31)),
+            ("01-09-2025 06:00:00", "01-10-2025 12:00:00")
+        )
+    def test_february(self):
+        self.assertEqual(
+            next_week_targets(dt.date(2025, 2, 28)),
+            ("03-06-2025 06:00:00", "03-07-2025 12:00:00")
+        )
+    def test_leap_year(self):
+        self.assertEqual(
+            next_week_targets(dt.date(2024, 2, 29)),
+            ("03-07-2024 06:00:00", "03-08-2024 12:00:00")
+        )
 
-      # manual Azure escape: only %, CR, LF
-      safe = (combined
-              .replace('%', '%25')
-              .replace('\r', '%0D')
-              .replace('\n', '%0A'))
-
-      # publish pipeline variables
-      print(f"##vso[task.setvariable variable=releaseNumber]{rel_num}")
-      print(f"##vso[task.setvariable variable=shortDescription]Welcome to release {rel_num}")
-      print(f"##vso[task.setvariable variable=descriptionEsc]{safe}")
-
-#───────────────────────────────────────────────────────────────────────────────
-# 3) (Optional) Verify at runtime that you really get multi-line text back
-- task: PythonScript@0
-  displayName: Decode & verify descriptionEsc
-  env:
-    DESCRIPTION_ESC: $(descriptionEsc)
-  inputs:
-    scriptSource: inline
-    script: |
-      import os, textwrap
-      esc = os.getenv('DESCRIPTION_ESC')
-      # reverse only the three Azure escapes
-      dec = (esc
-             .replace('%0A', '\n')
-             .replace('%0D', '\r')
-             .replace('%25', '%'))
-      print('--- decoded release text ---')
-      print(textwrap.indent(dec, '  '))
-
-#───────────────────────────────────────────────────────────────────────────────
-# 4) Any downstream task—custom or built-in—can now accept $(descriptionEsc)
-- task: MyCustomTask@1
-  displayName: Consume full release notes
-  inputs:
-    releaseNumber: $(releaseNumber)
-    title:         $(shortDescription)
-    fullNotes:     $(descriptionEsc)
+if __name__ == "__main__":
+    unittest.main()
