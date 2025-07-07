@@ -1,132 +1,174 @@
-# Refactor: separate **source loading** from **table parsing**
+# ============================================================
+# release_lookup.py  —  unified loader (.doc/.docx) + parser
+# ============================================================
 #
-# ┌────────────────────────┐
-# │ 1. load_docx_from_path │  ← I/O boundary (disk)          (replaceable)
-# └────────────────────────┘
-#                │ returns python‑docx Document
-# ┌────────────────────────┐
-# │ 2. parse_release_table │  ← core parser (pure function)  (stable)
-# └────────────────────────┘
+#  • load_docx_any() detects legacy .doc and converts via pypandoc
+#  • parse_release_table() extracts the multi‑page Confluence table
+#  • get_squad_name() queries by Branch Date
 #
-# The parser operates only on a *Document* instance, so switching to a
-# REST source tomorrow means replacing the loader while re‑using the parser.
+# Unit‑tests below monkey‑patch pypandoc.convert_file so the suite
+# runs without the actual pandoc binary.
+# ============================================================
+
+from __future__ import annotations
 
 from datetime import datetime
 from typing import Tuple, Optional, Dict, List
+import os
+import re
+import shutil
+import tempfile
+
 import pandas as pd
 from docx import Document
-import unittest
-import tempfile
-import re
-from io import BytesIO
+from docx.opc.exceptions import PackageNotFoundError
 
 # ---------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------
-TARGET_PREFIXES: Tuple[str, ...] = ("Release Version",
-                                    "RT Driver Squad",
-                                    "Branch Date")
-
+TARGET_PREFIXES: Tuple[str, ...] = (
+    "Release Version",
+    "RT Driver Squad",
+    "Branch Date",
+)
 
 # ---------------------------------------------------------------------
-# Helpers
+# Utility helpers
 # ---------------------------------------------------------------------
 def _normalise(text: str) -> str:
-    """Lower‑case *text* and remove **all** whitespace."""
+    """Lower‑case *text* and strip ALL whitespace."""
     return re.sub(r"\s+", "", text.lower())
 
 
-def _match_required_prefixes(header_cells: List[str],
-                             prefixes: Tuple[str, ...]) -> Optional[Dict[str, int]]:
+def _match_required_prefixes(
+    header_cells: List[str], prefixes: Tuple[str, ...]
+) -> Optional[Dict[str, int]]:
     """
-    Return mapping **prefix → column_index** if every prefix is matched
-    (whitespace‑ and case‑insensitive `startswith`); otherwise *None*.
+    Map canonical *prefix* → column_index when each prefix is present
+    (case‑ & whitespace‑insensitive starts‑with). Otherwise return *None*.
     """
     prefix_to_index: Dict[str, int] = {}
-    normalised_headers = [_normalise(cell) for cell in header_cells]
-    normalised_prefixes = {_normalise(p): p for p in prefixes}
+    norm_headers = [_normalise(c) for c in header_cells]
+    norm_to_canonical = {_normalise(p): p for p in prefixes}
 
-    for col_idx, header_norm in enumerate(normalised_headers):
-        for prefix_norm, canonical_prefix in normalised_prefixes.items():
-            if header_norm.startswith(prefix_norm):
-                prefix_to_index[canonical_prefix] = col_idx
+    for col_idx, norm_header in enumerate(norm_headers):
+        for norm_prefix, canonical in norm_to_canonical.items():
+            if norm_header.startswith(norm_prefix):
+                prefix_to_index[canonical] = col_idx
                 break
 
-    if len(prefix_to_index) == len(prefixes):
-        return prefix_to_index
-    return None
+    return prefix_to_index if len(prefix_to_index) == len(prefixes) else None
 
 
 # ---------------------------------------------------------------------
-# 1.  SOURCE LOADERS (I/O layer)
+# Loader layer (I/O boundary)
 # ---------------------------------------------------------------------
-def load_docx_from_path(path: str) -> Document:
-    """Load a Word document from *path* on disk."""
-    return Document(path)
-
-
-def load_docx_from_bytes(data: bytes) -> Document:
-    """Load a Word document from a byte string (e.g., HTTP response)."""
-    return Document(BytesIO(data))
-
-
-# ---------------------------------------------------------------------
-# 2.  CORE PARSER (pure function)
-# ---------------------------------------------------------------------
-def parse_release_table(document: Document,
-                        prefixes: Tuple[str, ...] = TARGET_PREFIXES) -> pd.DataFrame:
+def _convert_with_pandoc(src_doc: str) -> str:
     """
-    Inspect *document* (python‑docx Document) and build a DataFrame from all
-    tables that contain the required *prefixes*.
+    Convert legacy *.doc* file to *.docx* using pypandoc.
+    Returns the path to a temporary .docx file.
+    """
+    try:
+        import pypandoc  # local import to keep top‑level requirements minimal
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "pypandoc is required to convert .doc files but is not installed. "
+            "Install with `pip install pypandoc` or convert files manually."
+        ) from exc
 
-    Header matching is case‑insensitive and whitespace‑insensitive.
+    dst_path = tempfile.mktemp(suffix=".docx")
+    # pypandoc returns the output path on success
+    pypandoc.convert_file(src_doc, "docx", outputfile=dst_path)
+    return dst_path
+
+
+def load_docx_any(path: str) -> Document:
+    """
+    Load a Word document from *path*.
+    • .docx → open directly.
+    • .doc  → convert via pypandoc then open.
+    """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+
+    ext = os.path.splitext(path)[1].lower()
+    docx_path = path
+
+    if ext == ".doc":
+        docx_path = _convert_with_pandoc(path)
+
+    try:
+        return Document(docx_path)
+    except PackageNotFoundError as exc:
+        raise ValueError(
+            f"{path} exists but is not a valid Word file "
+            f"or the conversion failed ({exc})"
+        ) from None
+
+
+def read_release_table(path: str) -> pd.DataFrame:
+    """
+    Convenience façade: load from disk (any extension) then parse.
+    """
+    return parse_release_table(load_docx_any(path))
+
+
+# ---------------------------------------------------------------------
+# Core parser (pure function)
+# ---------------------------------------------------------------------
+def parse_release_table(
+    document: Document, prefixes: Tuple[str, ...] = TARGET_PREFIXES
+) -> pd.DataFrame:
+    """
+    Extract rows from all tables in *document* that contain all *prefixes*.
+    Header matching ignores case and whitespace. Rows from multiple tables
+    are concatenated.
     """
     if not document.tables:
         raise ValueError("Document contains no tables.")
 
-    collected_rows: List[Dict[str, str]] = []
+    rows: List[Dict[str, str]] = []
 
     for table in document.tables:
         if not table.rows:
             continue
 
-        header_cells = [cell.text.strip() for cell in table.rows[0].cells]
+        header_cells = [c.text.strip() for c in table.rows[0].cells]
         prefix_to_index = _match_required_prefixes(header_cells, prefixes)
         if prefix_to_index is None:
-            continue  # ignore irrelevant table
+            continue  # table missing required headers — skip
 
         for row in table.rows[1:]:
-            collected_rows.append({
-                prefix: row.cells[prefix_to_index[prefix]].text.strip()
-                for prefix in prefixes
-            })
+            rows.append(
+                {
+                    prefix: row.cells[prefix_to_index[prefix]].text.strip()
+                    for prefix in prefixes
+                }
+            )
 
-    if not collected_rows:
+    if not rows:
         raise ValueError("No tables with the required columns were found.")
 
-    df = pd.DataFrame(collected_rows)
-    df["Branch Date"] = pd.to_datetime(df["Branch Date"],
-                                       format="%d %b %Y",
-                                       errors="coerce")
+    df = pd.DataFrame(rows)
+    df["Branch Date"] = pd.to_datetime(df["Branch Date"], format="%d %b %Y", errors="coerce")
     df.dropna(subset=["Branch Date"], inplace=True)
     return df
 
 
-# Convenience wrapper preserving old name
-def read_release_table(docx_path: str,
-                       prefixes: Tuple[str, ...] = TARGET_PREFIXES) -> pd.DataFrame:
-    """Load from disk then parse – legacy helper."""
-    return parse_release_table(load_docx_from_path(docx_path), prefixes)
-
-
 # ---------------------------------------------------------------------
-# 3.  QUERY FUNCTION
+# Query helper
 # ---------------------------------------------------------------------
-def get_squad_name(df: pd.DataFrame,
-                   branch_date: str | datetime) -> Optional[Tuple[str, str]]:
-    date_norm = (pd.to_datetime(branch_date, format="%d %b %Y")
-                 if isinstance(branch_date, str)
-                 else pd.to_datetime(branch_date))
+def get_squad_name(
+    df: pd.DataFrame, branch_date: str | datetime
+) -> Optional[Tuple[str, str]]:
+    """
+    Return (RT Driver Squad, Release Version) for *branch_date*, or None.
+    """
+    date_norm = (
+        pd.to_datetime(branch_date, format="%d %b %Y")
+        if isinstance(branch_date, str)
+        else pd.to_datetime(branch_date)
+    )
     match = df[df["Branch Date"] == date_norm]
     if match.empty:
         return None
@@ -135,42 +177,73 @@ def get_squad_name(df: pd.DataFrame,
 
 
 # ---------------------------------------------------------------------
-# 4.  UNIT TESTS
+# Unit‑tests -----------------------------------------------------------
 # ---------------------------------------------------------------------
-class _SeparationOfConcernsTests(unittest.TestCase):
+import unittest
+from io import BytesIO
 
-    def setUp(self):
-        # Build an in‑memory DOCX and also save it to disk
-        self.temp_doc = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
-        doc = Document()
+class _PandocLoaderTests(unittest.TestCase):
+    """
+    Validate loader + parser.
+    The test monkey‑patches pypandoc.convert_file so it works without pandoc.
+    """
 
-        # Relevant table
-        tbl = doc.add_table(rows=1, cols=3)
-        tbl.rows[0].cells[0].text = "release version"
-        tbl.rows[0].cells[1].text = "RT Driver Squad"
-        tbl.rows[0].cells[2].text = "branch date (utc)"
-        row = tbl.add_row().cells
-        row[0].text, row[1].text, row[2].text = "27.0", "Poseidon", "07 Jul 2025"
+    @classmethod
+    def setUpClass(cls):
+        # Create a Word document in memory
+        cls.doc = Document()
+        tbl = cls.doc.add_table(rows=1, cols=3)
+        tbl.rows[0].cells[0].text = "release version train"
+        tbl.rows[0].cells[1].text = "RTDriverSquadTeam"
+        tbl.rows[0].cells[2].text = "BranchDate(UTC)"
+        data_row = tbl.add_row().cells
+        data_row[0].text, data_row[1].text, data_row[2].text = "30.0", "Athena", "07 Jul 2025"
 
-        # Save to disk and to bytes
-        doc.save(self.temp_doc.name)
-        buf = BytesIO()
-        doc.save(buf)
-        self.buf_bytes = buf.getvalue()
+        # Save one copy as .docx
+        cls.docx_path = tempfile.mktemp(suffix=".docx")
+        cls.doc.save(cls.docx_path)
 
-    def tearDown(self):
-        self.temp_doc.close()
+        # Save second copy as .doc (actually a docx inside, but good enough)
+        cls.doc_path = tempfile.mktemp(suffix=".doc")
+        cls.doc.save(cls.doc_path)
 
-    # --- tests --------------------------------------------------------
-    def test_disk_loader(self):
-        doc_from_disk = load_docx_from_path(self.temp_doc.name)
-        df = parse_release_table(doc_from_disk)
-        self.assertEqual(get_squad_name(df, "07 Jul 2025"), ("Poseidon", "27.0"))
+        # Monkey‑patch pypandoc.convert_file
+        import types, sys
+        fake_pandoc = types.ModuleType("pypandoc")
+        sys.modules["pypandoc"] = fake_pandoc
 
-    def test_bytes_loader(self):
-        doc_from_bytes = load_docx_from_bytes(self.buf_bytes)
-        df = parse_release_table(doc_from_bytes)
-        self.assertEqual(get_squad_name(df, "07 Jul 2025"), ("Poseidon", "27.0"))
+        def _fake_convert_file(src, to, outputfile):
+            # Simply copy the input file (already really a docx) to output
+            shutil.copyfile(src, outputfile)
+            return outputfile
+
+        fake_pandoc.convert_file = _fake_convert_file
+
+    @classmethod
+    def tearDownClass(cls):
+        os.unlink(cls.docx_path)
+        os.unlink(cls.doc_path)
+
+    # ------------------------------------------------------------
+    def test_load_docx(self):
+        df = read_release_table(self.__class__.docx_path)
+        self.assertEqual(get_squad_name(df, "07 Jul 2025"), ("Athena", "30.0"))
+
+    def test_load_doc(self):
+        df = read_release_table(self.__class__.doc_path)
+        self.assertEqual(get_squad_name(df, "07 Jul 2025"), ("Athena", "30.0"))
+
+    def test_missing_file(self):
+        with self.assertRaises(FileNotFoundError):
+            read_release_table("/nonexistent/file.docx")
+
+    def test_no_table(self):
+        # Create empty docx
+        empty_path = tempfile.mktemp(suffix=".docx")
+        Document().save(empty_path)
+        with self.assertRaises(ValueError):
+            read_release_table(empty_path)
+        os.unlink(empty_path)
 
 
-unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(_SeparationOfConcernsTests))
+unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(_PandocLoaderTests))
