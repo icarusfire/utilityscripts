@@ -35,6 +35,17 @@ def _normalise(text: str) -> str:
     """Lower‑case *text* and remove **all** whitespace."""
     return re.sub(r"\s+", "", text.lower())
 
+def get_assignment_group(squad_name: str) -> Optional[str]:
+    """
+    Return the technical code whose key token is contained inside *squad_name*
+    (case-insensitive).  First match wins; returns **None** if nothing fits.
+    """
+    name_norm = squad_name.lower()
+    for token, code in _SQUAD_TO_TECH.items():
+        if token in name_norm:
+            return code
+    return None
+
 
 def _match_required_prefixes(header_cells: List[str],
                              prefixes: Tuple[str, ...]) -> Optional[Dict[str, int]]:
