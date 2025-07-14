@@ -1,20 +1,21 @@
-def next_week_targets_for_servicenow(today=None):
-    """Return UTC strings that will *display* as 06:00 / 12:00 in NL."""
-    if today is None:
-        today = datetime.now(ZoneInfo(LOCAL_TZ)).date()
+# matches “…from":"<number>","to":"<number>”
+_RANGE_RE = re.compile(r'from%22%3A%22\d+%22%2C%22to%22%3A%22\d+%22')
 
-    this_monday = today - timedelta(days=today.weekday())
+def make_grafana_link(base_url, when=None, tz_name="Europe/Amsterdam"):
+    """
+    Replace the 'from' and 'to' range in `base_url` with the epoch-millisecond
+    timestamp for next Monday at 07:00 in the given time zone.
+    """
+    tz = ZoneInfo(tz_name)
+    now = when.astimezone(tz) if when else datetime.now(tz)
+
+    # Monday of the current week (Monday = 0)
+    this_monday = (now - timedelta(days=now.weekday())).date()
+    # Monday of next week
     next_monday = this_monday + timedelta(days=7)
 
-    th_local = datetime.combine(next_monday + timedelta(days=3),
-                                time(6, 0, 0),
-                                tzinfo=ZoneInfo(LOCAL_TZ))
-    fr_local = datetime.combine(next_monday + timedelta(days=4),
-                                time(12, 0, 0),
-                                tzinfo=ZoneInfo(LOCAL_TZ))
+    target = datetime.combine(next_monday, time(7, 0), tzinfo=tz)
+    epoch_ms = int(target.timestamp() * 1000)
 
-    th_utc = th_local.astimezone(timezone.utc)
-    fr_utc = fr_local.astimezone(timezone.utc)
-
-    fmt = "%m-%d-%Y %H:%M:%S"
-    return th_utc.strftime(fmt), fr_utc.strftime(fmt)
+    replacement = f'from%22%3A%22{epoch_ms}%22%2C%22to%22%3A%22{epoch_ms}%22'
+    return _RANGE_RE.sub(replacement, base_url)
