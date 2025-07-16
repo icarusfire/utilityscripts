@@ -1,21 +1,83 @@
-# matches “…from":"<number>","to":"<number>”
-_RANGE_RE = re.compile(r'from%22%3A%22\d+%22%2C%22to%22%3A%22\d+%22')
+- bash: |
+    pipelineId="$(resources.pipeline.ReleaseNotes.pipelineId)"
+    api="$(System.CollectionUri)$(System.TeamProject)/_apis/build/builds?definitions=$pipelineId&resultFilter=succeeded&$top=5&api-version=7.2-preview"
 
-def make_grafana_link(base_url, when=None, tz_name="Europe/Amsterdam"):
-    """
-    Replace the 'from' and 'to' range in `base_url` with the epoch-millisecond
-    timestamp for next Monday at 07:00 in the given time zone.
-    """
-    tz = ZoneInfo(tz_name)
-    now = when.astimezone(tz) if when else datetime.now(tz)
+    # grab the last 5 successful run IDs
+    runIds=$(curl -sS -u :$(System.AccessToken) "$api" | jq -r '.value[].id')
 
-    # Monday of the current week (Monday = 0)
-    this_monday = (now - timedelta(days=now.weekday())).date()
-    # Monday of next week
-    next_monday = this_monday + timedelta(days=7)
+    for id in $runIds; do
+      echo "Downloading ReleaseNotesKansCHG from run $id"
+      echo "##vso[artifact.download artifactname=ReleaseNotesKansCHG;runId=$id;path=$(Pipeline.Workspace)/ReleaseNotes/$id]"
+    done
+  displayName: Download last 5 ReleaseNotes artifacts
 
-    target = datetime.combine(next_monday, time(7, 0), tzinfo=tz)
-    epoch_ms = int(target.timestamp() * 1000)
 
-    replacement = f'from%22%3A%22{epoch_ms}%22%2C%22to%22%3A%22{epoch_ms}%22'
-    return _RANGE_RE.sub(replacement, base_url)
+
+- script: |
+    echo "Using run ID: $(resources.pipeline.ReleaseNotes.runId)"
+    echo "Published run name: $(resources.pipeline.ReleaseNotes.runName)"
+    echo "Available artifacts:"
+    ls -R "$(Pipeline.Workspace)/ReleaseNotes/"
+  displayName: Show release notes runs & artifacts
+
+- script: |
+    python get_release_notes.py "$(target_num)"
+  name: pickNotes
+  displayName: Pick target release notes
+
+
+
+import os
+import pathlib
+import sys
+
+def get_release_notes(target_num, max_runs=5):
+    ws = os.getenv('PIPELINE_WORKSPACE', '.')
+    release_root = pathlib.Path(ws) / 'ReleaseNotes'
+
+    # newest first
+    run_dirs = sorted(
+        (d for d in release_root.iterdir() if d.is_dir()),
+        key=lambda d: d.stat().st_mtime,
+        reverse=True)[:max_runs]
+
+    for run_dir in run_dirs:  # newest → oldest among last max_runs
+        root = run_dir / 'ReleaseNotesKansCHG'
+        if not root.is_dir():
+            continue
+
+        for rel_dir in root.iterdir():
+            if not rel_dir.is_dir():
+                continue
+
+            try:
+                rel_num = rel_dir.name.split('_')[0]
+                if rel_num != target_num:
+                    continue
+
+                notes_path = root / 'RELEASE_NOTES.md'
+                all_path = rel_dir / f'{rel_num}_all.txt'
+
+                notes = notes_path.read_text(encoding='utf-8')
+                all_txt = all_path.read_text(encoding='utf-8')
+            except Exception as exc:
+                # log + skip this rel_dir; continue searching
+                print(f'Skipping run {run_dir.name} ({rel_dir.name}): {exc}')
+                continue
+
+            combined = notes + '\n\n' + all_txt
+            description = (combined
+                .replace('%', '%25')
+                .replace('\r', '%0D')
+                .replace('\n', '%0A'))
+            return rel_num, description
+
+    raise ValueError(f'No matching release num {target_num} found in last {max_runs} runs.')
+
+# CLI wrapper so pipeline step can capture variables
+if __name__ == '__main__':
+    if len(sys.argv) != 2:
+        sys.exit('usage: python get_release_notes.py <target_num>')
+    rel, desc = get_release_notes(sys.argv[1])
+    print(f'##vso[task.setvariable variable=rel_num;isOutput=true]{rel}')
+    print(f'##vso[task.setvariable variable=description;isOutput=true]{desc}')
