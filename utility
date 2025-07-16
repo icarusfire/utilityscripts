@@ -1,4 +1,41 @@
 - bash: |
+    set -euo pipefail
+
+    # 1. get the last 5 successful run IDs
+    pipelineId="$(resources.pipeline.ReleaseNotes.pipelineId)"
+    runsApi="${SYSTEM_COLLECTIONURI}${SYSTEM_TEAMPROJECT}/_apis/build/builds?definitions=${pipelineId}&resultFilter=succeeded&\$top=5&api-version=7.2-preview"
+    runIds=$(curl -sS -u :${SYSTEM_ACCESSTOKEN} "$runsApi" \
+             | jq -r '.value[].id')
+
+    for id in $runIds; do
+      echo "→ Fetching artifact metadata for run $id"
+      # 2. list artifacts, pick the ReleaseNotesKansCHG downloadUrl
+      artsApi="${SYSTEM_COLLECTIONURI}${SYSTEM_TEAMPROJECT}/_apis/build/builds/${id}/artifacts?api-version=6.0"
+      downloadUrl=$(curl -sS -u :${SYSTEM_ACCESSTOKEN} "$artsApi" \
+                    | jq -r '.value[] 
+                             | select(.name=="ReleaseNotesKansCHG") 
+                             | .resource.downloadUrl')
+
+      if [[ -z "$downloadUrl" || "$downloadUrl" == "null" ]]; then
+        echo "   – no ReleaseNotesKansCHG in run $id, skipping"
+        continue
+      fi
+
+      targetDir="$(Pipeline.Workspace)/ReleaseNotes/$id"
+      mkdir -p "$targetDir"
+
+      echo "→ Downloading & extracting to $targetDir"
+      curl -sSL -u :${SYSTEM_ACCESSTOKEN} "$downloadUrl" -o artifact.zip
+      unzip -qq artifact.zip -d "$targetDir"
+      rm artifact.zip
+    done
+  displayName: Download last 5 ReleaseNotes artifacts (via REST)
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+
+
+- bash: |
     pipelineId="$(resources.pipeline.ReleaseNotes.pipelineId)"
     api="$(System.CollectionUri)$(System.TeamProject)/_apis/build/builds?definitions=$pipelineId&resultFilter=succeeded&$top=5&api-version=7.2-preview"
 
