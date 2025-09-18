@@ -1,1 +1,20 @@
+type: specs.openrewrite.org/v1beta/recipe
+name: com.yourorg.immutables.AddJakartaStyleOnImmutables
+displayName: Add @Value.Style(jakarta=true) to @Value.Immutable types
+description: For any type annotated with @org.immutables.value.Value.Immutable, add @org.immutables.value.Value.Style and set jakarta=true.
+applicability:
+  singleSource:
+    - org.openrewrite.java.search.FindAnnotations:
+        annotationPattern: '@org.immutables.value.Value.Immutable'
+recipeList:
+  # 1) Add the annotation to matching classes/interfaces
+  - org.openrewrite.java.dropwizard.annotation.AddClassAnnotationIfAnnotationExists:
+      annotationToAdd: 'org.immutables.value.Value.Style'
+      targetAnnotationClassName: 'org.immutables.value.Value.Immutable'
+      annotateInnerClasses: false
 
+  # 2) Make sure it’s exactly @Value.Style(jakarta = true)
+  - org.openrewrite.java.AddOrUpdateAnnotationAttribute:
+      annotationType: 'org.immutables.value.Value.Style'
+      attributeName: 'jakarta'
+      attributeValue: 'true'
