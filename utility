@@ -1,20 +1,354 @@
-type: specs.openrewrite.org/v1beta/recipe
-name: com.yourorg.immutables.AddJakartaStyleOnImmutables
-displayName: Add @Value.Style(jakarta=true) to @Value.Immutable types
-description: For any type annotated with @org.immutables.value.Value.Immutable, add @org.immutables.value.Value.Style and set jakarta=true.
-applicability:
-  singleSource:
-    - org.openrewrite.java.search.FindAnnotations:
-        annotationPattern: '@org.immutables.value.Value.Immutable'
-recipeList:
-  # 1) Add the annotation to matching classes/interfaces
-  - org.openrewrite.java.dropwizard.annotation.AddClassAnnotationIfAnnotationExists:
-      annotationToAdd: 'org.immutables.value.Value.Style'
-      targetAnnotationClassName: 'org.immutables.value.Value.Immutable'
-      annotateInnerClasses: false
+azure-pipelines.yml
+scripts/
+  set_release_train.py
+  detect_whitelist_only_change.py
+  cherry_pick_and_create_pr.py
 
-  # 2) Make sure it’s exactly @Value.Style(jakarta = true)
-  - org.openrewrite.java.AddOrUpdateAnnotationAttribute:
-      annotationType: 'org.immutables.value.Value.Style'
-      attributeName: 'jakarta'
-      attributeValue: 'true'
+
+------
+
+
+# Trigger: only when whitelist.yaml changes on master (minimize runs).
+trigger:
+  branches:
+    include:
+      - master
+  paths:
+    include:
+      - myrepo/module1/pipelines/whitelist.yaml
+
+pr: none
+
+variables:
+  # Repo-relative path to watch (normalized with leading slash in API).
+  WATCH_PATH: /myrepo/module1/pipelines/whitelist.yaml
+  # Name prefix for the temporary branch created by cherry-pick:
+  CHERRY_BRANCH_PREFIX: refs/heads/cherry/whitelist
+  SYSTEM_DEBUG: false
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: cherry_pick_whitelist
+  displayName: 'Cherry-pick whitelist.yaml to release train'
+  jobs:
+  - job: run_logic
+    displayName: 'Verify change & create PR'
+    steps:
+    - checkout: self
+      persistCredentials: true   # enables $(System.AccessToken) for REST calls
+
+    # Dummy step for now: sets releaseTrainBranch to "5.123"
+    - task: UsePythonVersion@0
+      displayName: 'Use Python 3.x'
+      inputs:
+        versionSpec: '3.x'
+
+    - script: |
+        python3 scripts/set_release_train.py
+      displayName: 'Set releaseTrainBranch (dummy for now)'
+      name: setrt
+
+    # Detect whether the original PR changed ONLY the whitelist file
+    - script: |
+        python3 scripts/detect_whitelist_only_change.py \
+          --watch-path "$(WATCH_PATH)"
+      displayName: 'Detect if ONLY whitelist.yaml changed in the original PR'
+      name: detect
+
+    # If detection says proceed, do cherry-pick + PR creation
+    - script: |
+        python3 scripts/cherry_pick_and_create_pr.py \
+          --release-train "$(releaseTrainBranch)"
+      displayName: 'Cherry-pick PR onto release train and open PR'
+      condition: and(succeeded(), eq(variables['shouldCherryPick'], 'true'))
+      name: cherry
+
+    # Always print out what happened (including link if created)
+    - script: |
+        echo "Decision: shouldCherryPick=$(shouldCherryPick)"
+        echo "Original PR Id (if found): $(sourcePrId)"
+        echo "Changed files (count): $(changedFileCount)"
+        echo "Changed file (if single): $(changedFilePath)"
+        echo "Cherry-pick branch: $(cherryBranchName)"
+        echo "Created PR URL (if any): $(createdPrUrl)"
+      displayName: 'Summary'
+
+
+
+-------
+
+
+
+#!/usr/bin/env python3
+import os, sys
+
+# For now this is static; later you’ll replace with your own logic.
+value = "5.123"
+
+# Set a pipeline variable `releaseTrainBranch` to the numeric value,
+# and also create a full ref for convenience in later script.
+print(f"##vso[task.setvariable variable=releaseTrainBranch]{value}")
+print("releaseTrainBranch set to", value)
+
+
+------ scripts/detect_whitelist_only_change.py ----
+
+
+#!/usr/bin/env python3
+import argparse, os, sys, time, json
+import requests
+
+def ado():
+    return {
+        "org_url": os.environ["SYSTEM_TEAMFOUNDATIONCOLLECTIONURI"].rstrip("/"),
+        "project": os.environ["SYSTEM_TEAMPROJECT"],
+        "repo_id": os.environ["BUILD_REPOSITORY_ID"],
+        "commit": os.environ["BUILD_SOURCEVERSION"],
+        "token": os.environ.get("SYSTEM_ACCESSTOKEN", "")
+    }
+
+def api(url):
+    return f"{url}?api-version=7.1"
+
+def auth_headers(token):
+    if not token:
+        print("SYSTEM_ACCESSTOKEN is not available. Enable 'Allow scripts to access OAuth token' or set persistCredentials: true.", file=sys.stderr)
+        sys.exit(1)
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+def set_var(name, value):
+    print(f"##vso[task.setvariable variable={name}]{value}")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--watch-path", required=True, help="Repo-absolute path beginning with /")
+    args = parser.parse_args()
+
+    cfg = ado()
+    headers = auth_headers(cfg["token"])
+    base = f"{cfg['org_url']}/{cfg['project']}/_apis/git/repositories/{cfg['repo_id']}"
+
+    # 1) Pull Request Query – map commit -> PR(s)
+    q_url = api(f"{cfg['org_url']}/{cfg['project']}/_apis/git/pullrequestquery")
+    body = {"queries": [{"items": [{"commitId": cfg["commit"]}]}]}
+    resp = requests.post(q_url, headers=headers, data=json.dumps(body))
+    resp.raise_for_status()
+    data = resp.json()
+
+    pr_id = None
+    try:
+        # The structure is queries[0].results[commitId] = [prs...]
+        results = data["results"][0]["result"]
+        # keys are commitIds; pick our commit id key (case-insensitive)
+        pr_list = None
+        for k, v in results.items():
+            if k.lower() == cfg["commit"].lower():
+                pr_list = v
+                break
+        if pr_list:
+            # Prefer the completed PR that produced the merge into master
+            # If multiple, pick the most recent by completion time.
+            pr_list_sorted = sorted(pr_list, key=lambda x: x.get("closedDate", ""), reverse=True)
+            pr_id = pr_list_sorted[0]["pullRequestId"] if pr_list_sorted else None
+    except Exception:
+        pass
+
+    if not pr_id:
+        # No PR—skip cherry-pick.
+        set_var("shouldCherryPick", "false")
+        set_var("sourcePrId", "")
+        set_var("changedFileCount", "0")
+        set_var("changedFilePath", "")
+        print("No originating PR found for this commit. Skipping.")
+        return
+
+    set_var("sourcePrId", str(pr_id))
+
+    # 2) Get latest iteration id
+    iters_url = api(f"{base}/pullRequests/{pr_id}/iterations")
+    iters = requests.get(iters_url, headers=headers).json()
+    if "value" not in iters or not iters["value"]:
+        set_var("shouldCherryPick", "false")
+        set_var("changedFileCount", "0")
+        set_var("changedFilePath", "")
+        print("PR has no iterations. Skipping.")
+        return
+
+    latest_iter_id = max(i["id"] for i in iters["value"])
+    # 3) Get the cumulative changes for the latest iteration (vs merge base)
+    chg_url = api(f"{base}/pullRequests/{pr_id}/iterations/{latest_iter_id}/changes")
+    changes = requests.get(chg_url, headers=headers).json()
+
+    paths = []
+    for ch in changes.get("changes", []):
+        item = ch.get("item")
+        if isinstance(item, dict):
+            p = item.get("path")
+            if p:
+                paths.append(p)
+
+    unique_paths = sorted(set(paths))
+    set_var("changedFileCount", str(len(unique_paths)))
+    if len(unique_paths) == 1:
+        set_var("changedFilePath", unique_paths[0])
+    else:
+        set_var("changedFilePath", "")
+
+    # 4) Enforce rule: exactly one file and it equals WATCH_PATH
+    if len(unique_paths) == 1 and unique_paths[0] == args.watch_path:
+        set_var("shouldCherryPick", "true")
+        print(f"Whitelist-only change verified: {unique_paths[0]}")
+    else:
+        set_var("shouldCherryPick", "false")
+        print(f"Skip: changed files = {unique_paths}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+----- scripts/cherry_pick_and_create_pr.py ---
+
+#!/usr/bin/env python3
+import argparse, os, sys, time, json, re
+import requests
+from datetime import datetime
+
+POLL_SECS = 2
+POLL_MAX = 120  # ~4 minutes
+
+def ado():
+    return {
+        "org_url": os.environ["SYSTEM_TEAMFOUNDATIONCOLLECTIONURI"].rstrip("/"),
+        "project": os.environ["SYSTEM_TEAMPROJECT"],
+        "repo_id": os.environ["BUILD_REPOSITORY_ID"],
+        "commit": os.environ["BUILD_SOURCEVERSION"],
+        "token": os.environ.get("SYSTEM_ACCESSTOKEN", ""),
+        "source_pr_id": os.environ.get("sourcePrId", ""),
+    }
+
+def api(url):
+    return f"{url}?api-version=7.1"
+
+def auth_headers(token):
+    if not token:
+        print("SYSTEM_ACCESSTOKEN is not available.", file=sys.stderr)
+        sys.exit(1)
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+def set_var(name, value):
+    print(f"##vso[task.setvariable variable={name}]{value}")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--release-train", required=True, help="e.g. 5.123")
+    args = parser.parse_args()
+
+    cfg = ado()
+    headers = auth_headers(cfg["token"])
+    base = f"{cfg['org_url']}/{cfg['project']}/_apis/git/repositories/{cfg['repo_id']}"
+
+    if not cfg["source_pr_id"]:
+        set_var("createdPrUrl", "")
+        print("No source PR id found. Nothing to do.")
+        return
+
+    # Build ref names
+    onto_ref = f"refs/heads/releasetrain/trains/{args.release_train}"
+
+    # Sanitize a short suffix for generated branch (commit short + timestamp)
+    commit_short = cfg["commit"][:8]
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    cherry_branch = f"refs/heads/cherry/whitelist-{commit_short}-to-{args.release_train}-{ts}"
+    set_var("cherryBranchName", cherry_branch)
+
+    # 1) Cherry-pick the PR into a new branch based on the release train
+    body = {
+      "generatedRefName": cherry_branch,
+      "ontoRefName": onto_ref,
+      "repository": {"id": cfg["repo_id"]},
+      "source": {
+        "pullRequestId": int(cfg["source_pr_id"])
+      }
+    }
+
+    cp_url = api(f"{base}/cherryPicks")
+    resp = requests.post(cp_url, headers=headers, data=json.dumps(body))
+    resp.raise_for_status()
+    cp = resp.json()
+    cp_id = cp.get("cherryPickId")
+    if not cp_id:
+        print("Unexpected response from cherry-picks API:", cp, file=sys.stderr)
+        sys.exit(2)
+
+    # 2) Poll until completed/failed
+    get_cp_url = api(f"{base}/cherryPicks/{cp_id}")
+    status = None
+    detail = None
+    for _ in range(POLL_MAX):
+        s = requests.get(get_cp_url, headers=headers).json()
+        status = s.get("status")
+        detail = s.get("detailedStatus", {})
+        if status in ("completed", "failed", "abandoned"):
+            break
+        time.sleep(POLL_SECS)
+
+    if status != "completed":
+        # Surface conflict/failure message for observability
+        msg = (detail or {}).get("failureMessage", "Cherry-pick did not complete.")
+        print(f"Cherry-pick status: {status}. Detail: {msg}")
+        set_var("createdPrUrl", "")
+        # Leave non-zero to surface in pipeline if you prefer:
+        sys.exit(3)
+
+    # 3) Open a PR from cherry branch -> onto_ref
+    pr_title = f"Cherry-pick whitelist.yaml from PR #{cfg['source_pr_id']} to {args.release_train}"
+    pr_body = {
+      "sourceRefName": cherry_branch,
+      "targetRefName": onto_ref,
+      "title": pr_title,
+      "description": (
+        f"Automated cherry-pick of PR #{cfg['source_pr_id']} "
+        f"({commit_short}) onto `{args.release_train}`.\n\n"
+        f"Scope: myrepo/module1/pipelines/whitelist.yaml only."
+      ),
+      "isDraft": False
+    }
+    pr_url = api(f"{base}/pullrequests")
+    pr_resp = requests.post(pr_url, headers=headers, data=json.dumps(pr_body))
+    pr_resp.raise_for_status()
+    pr = pr_resp.json()
+    web_url = pr.get("url")  # REST URL; try to build the friendly one too:
+    # Construct a friendly link if possible:
+    org_host = cfg["org_url"].replace("https://", "").rstrip("/")
+    friendly = (
+        f"{cfg['org_url']}/{cfg['project']}/_git/{os.environ.get('BUILD_REPOSITORY_NAME','')}"
+        f"/pullrequest/{pr.get('pullRequestId')}"
+    )
+
+    set_var("createdPrUrl", friendly)
+    print("Created PR:", friendly)
+
+if __name__ == "__main__":
+    main()
+
+
+---------------
+
+
+
+
+
+
+
+
+
+
