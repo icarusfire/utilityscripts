@@ -20,21 +20,20 @@ import requests
 from urllib.parse import quote
 
 # Reuse your existing connector. Ensure this import path matches where your utility lives.
-# For example, if your shared utility is at repo root: /your_module/azure_git_connector.py,
-# add that folder to PYTHONPATH or adjust the import accordingly.
+# Example: if your shared utility is at repo root as azure_git_connector.py, this import works.
 from azure_git_connector import AzureGitConnector  # <-- adjust if your module path differs
 
 
 def _auth_header(pat: str) -> dict:
     """
-    Use System.AccessToken as a PAT via Basic Auth (username can be blank).
+    Use a token as a PAT via Basic Auth (username can be blank).
     """
     import base64
     token = base64.b64encode(f":{pat}".encode("utf-8")).decode("utf-8")
     return {"Authorization": f"Basic {token}"}
 
 
-def fetch_file_from_branch_rest(git: AzureGitConnector, file_path: str, branch_name: str) -> bytes:
+def fetch_file_from_branch_rest(git: AzureGitConnector, file_path: str, branch_name: str, token: str) -> bytes:
     """
     Read a file's content from a specific branch using the Azure DevOps Items REST API.
     Returns UTF-8 bytes.
@@ -52,7 +51,7 @@ def fetch_file_from_branch_rest(git: AzureGitConnector, file_path: str, branch_n
         f"&api-version=7.1-preview.1"
     )
 
-    headers = _auth_header(git.access_token)
+    headers = _auth_header(token)
     r = requests.get(url, headers=headers)
     if r.status_code != 200:
         print(f"[ERROR] Failed to fetch {file_path} from branch '{branch_name}': "
@@ -72,17 +71,20 @@ def main():
                         help="Full ref for the train branch (e.g., 'refs/heads/releasetrain/trains/5.123').")
     parser.add_argument("--file-path", required=True,
                         help="Repository path to the file, starting with '/'.")
+    parser.add_argument("--access-token", required=False,
+                        help="Access token to authenticate (e.g., $(System.AccessToken)). "
+                             "If omitted, falls back to env var SYSTEM_ACCESSTOKEN.")
     args = parser.parse_args()
 
-    token = os.environ.get("SYSTEM_ACCESSTOKEN")
+    token = args.access_token or os.environ.get("SYSTEM_ACCESSTOKEN")
     if not token:
-        print("[ERROR] SYSTEM_ACCESSTOKEN is not available to the script.", file=sys.stderr)
+        print("[ERROR] No access token provided. Pass --access-token or set SYSTEM_ACCESSTOKEN.", file=sys.stderr)
         sys.exit(1)
 
     git = AzureGitConnector(token)
 
     # 1) Fetch the source file bytes from the specified branch (default you pass is 'master').
-    source_bytes = fetch_file_from_branch_rest(git, args.file_path, args.source_file_branch)
+    source_bytes = fetch_file_from_branch_rest(git, args.file_path, args.source_file_branch, token)
 
     # 2) Create a short-lived working branch FROM the target branch.
     ts = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
@@ -113,5 +115,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
