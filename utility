@@ -115,3 +115,47 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+--------
+
+
+
+
+def fetch_file_from_branch_rest(git: AzureGitConnector, file_path: str, branch_name: str, token: str) -> bytes:
+    """
+    Fetch raw file bytes from a given branch using the Items REST API with download=true.
+    This avoids any JSON decoding path and works for YAML or any text/binary file.
+    """
+    import base64
+    from urllib.parse import quote
+
+    org = git.organization_url.rstrip("/")
+    proj = git.project_name
+    repo_id = git.repository_id
+
+    encoded_path = quote(file_path, safe="/")
+    url = (
+        f"{org}/{proj}/_apis/git/repositories/{repo_id}/items"
+        f"?path={encoded_path}"
+        f"&versionType=branch&version={quote(branch_name)}"
+        f"&download=true"              # <— force raw bytes
+        f"&resolveLfs=true"
+        f"&api-version=7.1-preview.1"
+    )
+
+    hdr = {
+        "Authorization": "Basic " + base64.b64encode(f":{token}".encode()).decode(),
+        "Accept": "application/octet-stream",  # <— nudge server to send bytes
+    }
+
+    r = requests.get(url, headers=hdr)
+    if r.status_code != 200:
+        print(f"[ERROR] GET {url}\nStatus: {r.status_code}\nHeaders: {r.headers}\nBody (first 300): {r.text[:300]}", file=sys.stderr)
+        sys.exit(1)
+
+    return r.content
+
