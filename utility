@@ -1,121 +1,117 @@
-# CI only when the whitelist file changes on master
-trigger:
-  branches:
-    include:
-      - master
-  paths:
-    include:
-      - /myrepo/module1/pipelines/whitelist.yaml
-
-pr: none
-
-pool:
-  vmImage: 'ubuntu-latest'
-
-variables:
-  # Path to the file we sync
-  WHITELIST_PATH: '/myrepo/module1/pipelines/whitelist.yaml'
-
-jobs:
-- job: SyncWhitelistToRelease
-  steps:
-    # Ensure the job token is available to scripts and Git client
-    - checkout: self
-      persistCredentials: true  # leaves the OAuth token for scripts/clients to use (required). :contentReference[oaicite:1]{index=1}
-
-    # Dummy step that will later compute the train dynamically
-    - bash: |
-        echo "##vso[task.setvariable variable=releaseTrainBranch]5.123"
-      displayName: "Compute releaseTrainBranch (dummy now)"
-
-    # Run the Python sync script
-    - task: UsePythonVersion@0
-      inputs:
-        versionSpec: '3.x'
-
-    - script: |
-        python3 scripts/sync_whitelist_to_release.py \
-          --source-branch "refs/heads/master" \
-          --target-branch "refs/heads/releasetrain/trains/$(releaseTrainBranch)" \
-          --file-path "$(WHITELIST_PATH)"
-      displayName: "Sync whitelist.yaml to release train via PR"
-      env:
-        # Exposes the job access token to the script. In scripts it’s env var SYSTEM_ACCESSTOKEN. :contentReference[oaicite:2]{index=2}
-        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
-
-
-----
-
-
 #!/usr/bin/env python3
+"""
+Sync a single file from a given source branch (default: master) into a PR targeting a release-train branch.
+
+- Reads the file content via Azure DevOps Items REST API from the specified source branch.
+- Creates a short-lived work branch FROM the target release-train branch (so the PR diff is only that file).
+- Updates the file on the work branch and opens a PR into the target branch.
+- Prints the PR URL.
+
+Requirements:
+- Your existing AzureGitConnector utility (imported below).
+- Python packages: requests (this script) and azure-devops (used by your connector).
+"""
+
 import os
 import sys
 import argparse
-import base64
 import datetime
+import requests
+from urllib.parse import quote
 
-# Reuse your existing connector
-from your_module.azure_git_connector import AzureGitConnector  # adjust import path to your utility
+# Reuse your existing connector. Ensure this import path matches where your utility lives.
+# For example, if your shared utility is at repo root: /your_module/azure_git_connector.py,
+# add that folder to PYTHONPATH or adjust the import accordingly.
+from azure_git_connector import AzureGitConnector  # <-- adjust if your module path differs
 
-# Azure DevOps Python client models (installed via `pip install azure-devops`)
-from azure.devops.v7_1.git.models import GitVersionDescriptor, GitVersionType  # :contentReference[oaicite:7]{index=7}
 
-def read_file_from_branch(connector: AzureGitConnector, path: str, branch_ref: str) -> bytes:
+def _auth_header(pat: str) -> dict:
     """
-    Return file bytes from a specific branch ref.
+    Use System.AccessToken as a PAT via Basic Auth (username can be blank).
     """
-    vd = GitVersionDescriptor(version=branch_ref, version_type=GitVersionType.branch)
-    item = connector.git_client.get_item(
-        repository_id=connector.repository_id,
-        path=path,
-        project=connector.project_name,
-        version_descriptor=vd,
-        include_content=True
-    )  # Items - Get supports version descriptor + includeContent. :contentReference[oaicite:8]{index=8}
+    import base64
+    token = base64.b64encode(f":{pat}".encode("utf-8")).decode("utf-8")
+    return {"Authorization": f"Basic {token}"}
 
-    # azure-devops client returns content as string
-    content_str = item.content or ""
-    return content_str.encode("utf-8")
+
+def fetch_file_from_branch_rest(git: AzureGitConnector, file_path: str, branch_name: str) -> bytes:
+    """
+    Read a file's content from a specific branch using the Azure DevOps Items REST API.
+    Returns UTF-8 bytes.
+    """
+    org = git.organization_url.rstrip("/")           # e.g., https://dev.azure.com/ORG
+    proj = git.project_name
+    repo_id = git.repository_id
+
+    encoded_path = quote(file_path, safe="/")
+    url = (
+        f"{org}/{proj}/_apis/git/repositories/{repo_id}/items"
+        f"?path={encoded_path}"
+        f"&versionType=branch&version={quote(branch_name)}"
+        f"&includeContent=true&resolveLfs=true"
+        f"&api-version=7.1-preview.1"
+    )
+
+    headers = _auth_header(git.access_token)
+    r = requests.get(url, headers=headers)
+    if r.status_code != 200:
+        print(f"[ERROR] Failed to fetch {file_path} from branch '{branch_name}': "
+              f"{r.status_code} {r.text}", file=sys.stderr)
+        sys.exit(1)
+
+    data = r.json()
+    content = data.get("content", "")
+    return content.encode("utf-8")
+
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--source-branch", required=True, help="Full ref, e.g., refs/heads/master")
-    parser.add_argument("--target-branch", required=True, help="Full ref, e.g., refs/heads/releasetrain/trains/5.123")
-    parser.add_argument("--file-path", required=True, help="Repository path starting with /")
+    parser = argparse.ArgumentParser(description="Sync a single file into a PR targeting a release-train branch.")
+    parser.add_argument("--source-file-branch", required=True,
+                        help="Branch name to read the file from (e.g., 'master'). Not a full ref.")
+    parser.add_argument("--target-branch", required=True,
+                        help="Full ref for the train branch (e.g., 'refs/heads/releasetrain/trains/5.123').")
+    parser.add_argument("--file-path", required=True,
+                        help="Repository path to the file, starting with '/'.")
     args = parser.parse_args()
 
     token = os.environ.get("SYSTEM_ACCESSTOKEN")
     if not token:
-        print("SYSTEM_ACCESSTOKEN is not available to the script.", file=sys.stderr)
+        print("[ERROR] SYSTEM_ACCESSTOKEN is not available to the script.", file=sys.stderr)
         sys.exit(1)
 
     git = AzureGitConnector(token)
 
-    # 1) Read the master version of the file
-    master_bytes = read_file_from_branch(git, args.file_path, args.source_branch.replace("refs/heads/", ""))
+    # 1) Fetch the source file bytes from the specified branch (default you pass is 'master').
+    source_bytes = fetch_file_from_branch_rest(git, args.file_path, args.source_file_branch)
 
-    # 2) Create a short-lived working branch FROM the target branch
+    # 2) Create a short-lived working branch FROM the target branch.
     ts = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
     work_branch = f"auto/sync-whitelist-{ts}"
     git.set_branch(work_branch, source_branch_name=args.target_branch)
 
-    # 3) Write the master content into that working branch (base64 handled in your helper)
-    git.update_file_in_branch(work_branch, args.file_path, master_bytes)
+    # 3) Update the file content on the work branch.
+    git.update_file_in_branch(work_branch, args.file_path, source_bytes)
 
-    # 4) Open a PR from the working branch into the target release train branch
-    pr_title = f"[SYNC] {args.file_path} from master to {args.target_branch}"
+    # 4) Open a PR from work_branch -> target branch and print its URL.
+    pr_title = f"[SYNC] {args.file_path} from {args.source_file_branch} to {args.target_branch}"
     pr_desc = (
         f"Automated sync of {args.file_path}\n\n"
-        f"Source: {args.source_branch}\nTarget: {args.target_branch}\n"
+        f"Source branch: {args.source_file_branch}\n"
+        f"Target: {args.target_branch}\n"
         f"Time (UTC): {datetime.datetime.utcnow().isoformat()}Z"
     )
-    pr_url = git.create_git_request(source_branch_name=work_branch,
-                                    target_branch_name=args.target_branch,
-                                    title=pr_title,
-                                    description=pr_desc)  # Uses Git Pull Requests API. :contentReference[oaicite:9]{index=9}
 
-    # 5) Print the final PR URL (visible in pipeline logs)
+    pr_url = git.create_git_request(
+        source_branch_name=work_branch,
+        target_branch_name=args.target_branch,
+        title=pr_title,
+        description=pr_desc
+    )
+
     print(pr_url)
+
 
 if __name__ == "__main__":
     main()
+
+
