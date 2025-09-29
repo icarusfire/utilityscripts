@@ -1,79 +1,65 @@
-#!/usr/bin/env python3
-"""
-Sync a single file from a given source branch (default: master) into a PR targeting a release-train branch.
-
-- Reads the file content via Azure DevOps Items REST API from the specified source branch.
-- Creates a short-lived work branch FROM the target release-train branch (so the PR diff is only that file).
-- Updates the file on the work branch and opens a PR into the target branch.
-- Prints the PR URL.
-
-Requirements:
-- Your existing AzureGitConnector utility (imported below).
-- Python packages: requests (this script) and azure-devops (used by your connector).
-"""
-
-import os
-import sys
-import argparse
-import datetime
-import requests
-from urllib.parse import quote
-
-# Reuse your existing connector. Ensure this import path matches where your utility lives.
-# Example: if your shared utility is at repo root as azure_git_connector.py, this import works.
-from azure_git_connector import AzureGitConnector  # <-- adjust if your module path differs
-
-
-def _auth_header(pat: str) -> dict:
+def parse_train_number(train_number: str) -> tuple[str, str]:
     """
-    Use a token as a PAT via Basic Auth (username can be blank).
+    Given '5.123' -> returns ('5.123', '5.122').
     """
-    import base64
-    token = base64.b64encode(f":{pat}".encode("utf-8")).decode("utf-8")
-    return {"Authorization": f"Basic {token}"}
+    import re
+    m = re.fullmatch(r"([^\.]+)\.(\d+)", train_number.strip())
+    if not m:
+        raise ValueError(f"Invalid train number format: {train_number}. Expected like '5.123'.")
+    major, minor_str = m.group(1), m.group(2)
+    minor = int(minor_str)
+    if minor <= 0:
+        raise ValueError(f"Cannot decrement {train_number} because the minor part is <= 0.")
+    return f"{major}.{minor}", f"{major}.{minor-1}"
 
 
-def fetch_file_from_branch_rest(git: AzureGitConnector, file_path: str, branch_name: str, token: str) -> bytes:
-    """
-    Read a file's content from a specific branch using the Azure DevOps Items REST API.
-    Returns UTF-8 bytes.
-    """
-    org = git.organization_url.rstrip("/")           # e.g., https://dev.azure.com/ORG
-    proj = git.project_name
-    repo_id = git.repository_id
+def make_target_ref(train_str: str) -> str:
+    return f"refs/heads/releasetrain/trains/{train_str}"
 
-    encoded_path = quote(file_path, safe="/")
-    url = (
-        f"{org}/{proj}/_apis/git/repositories/{repo_id}/items"
-        f"?path={encoded_path}"
-        f"&versionType=branch&version={quote(branch_name)}"
-        f"&includeContent=true&resolveLfs=true"
-        f"&api-version=7.1-preview.1"
+
+def create_pr_for_target(git, target_ref: str, file_path: str, content: bytes,
+                         source_file_branch_name: str) -> str:
+    """
+    Create a work branch FROM target_ref, write content, open PR back to target_ref.
+    Returns PR URL.
+    """
+    ts = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    safe_suffix = target_ref.split("/")[-1].replace(".", "-")  # e.g., '5.123' -> '5-123'
+    work_branch_short = f"auto/sync-{safe_suffix}-{ts}"
+
+    git.set_branch(work_branch_short, source_branch_name=target_ref)
+    git.update_file_in_branch(work_branch_short, file_path, content)
+
+    pr_title = f"[SYNC] {file_path} from {source_file_branch_name} to {target_ref}"
+    pr_desc = (
+        f"Automated sync of {file_path}\n\n"
+        f"Source file branch: {source_file_branch_name}\n"
+        f"PR target: {target_ref}\n"
+        f"Time (UTC): {datetime.datetime.utcnow().isoformat()}Z"
     )
 
-    headers = _auth_header(token)
-    r = requests.get(url, headers=headers)
-    if r.status_code != 200:
-        print(f"[ERROR] Failed to fetch {file_path} from branch '{branch_name}': "
-              f"{r.status_code} {r.text}", file=sys.stderr)
-        sys.exit(1)
+    return git.create_git_request(
+        source_branch_name=work_branch_short,
+        target_branch_name=target_ref,
+        title=pr_title,
+        description=pr_desc
+    )
 
-    data = r.json()
-    content = data.get("content", "")
-    return content.encode("utf-8")
+
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sync a single file into a PR targeting a release-train branch.")
+    parser = argparse.ArgumentParser(
+        description="Create two PRs to successive release-train branches from one source file branch."
+    )
+    parser.add_argument("--train-number", required=True,
+                        help="Train number like '5.123'. Will also target the previous '5.122'.")
     parser.add_argument("--source-file-branch", required=True,
                         help="Branch name to read the file from (e.g., 'master'). Not a full ref.")
-    parser.add_argument("--target-branch", required=True,
-                        help="Full ref for the train branch (e.g., 'refs/heads/releasetrain/trains/5.123').")
     parser.add_argument("--file-path", required=True,
                         help="Repository path to the file, starting with '/'.")
     parser.add_argument("--access-token", required=False,
-                        help="Access token to authenticate (e.g., $(System.AccessToken)). "
-                             "If omitted, falls back to env var SYSTEM_ACCESSTOKEN.")
+                        help="Access token (e.g., $(System.AccessToken)). If omitted, uses env SYSTEM_ACCESSTOKEN.")
     args = parser.parse_args()
 
     token = args.access_token or os.environ.get("SYSTEM_ACCESSTOKEN")
@@ -83,79 +69,26 @@ def main():
 
     git = AzureGitConnector(token)
 
-    # 1) Fetch the source file bytes from the specified branch (default you pass is 'master').
+    # Compute targets: current train and previous train
+    curr_train, prev_train = parse_train_number(args.train_number)
+    targets = [make_target_ref(curr_train), make_target_ref(prev_train)]
+
+    # Read source content once from the specified source branch
     source_bytes = fetch_file_from_branch_rest(git, args.file_path, args.source_file_branch, token)
 
-    # 2) Create a short-lived working branch FROM the target branch.
-    ts = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    work_branch = f"auto/sync-whitelist-{ts}"
-    git.set_branch(work_branch, source_branch_name=args.target_branch)
+    # Create PRs for both targets
+    pr_urls = []
+    for target_ref in targets:
+        try:
+            pr_url = create_pr_for_target(
+                git, target_ref, args.file_path, source_bytes, args.source_file_branch
+            )
+            pr_urls.append(pr_url)
+        except Exception as e:
+            print(f"[ERROR] Failed creating PR for target {target_ref}: {e}", file=sys.stderr)
+            # continue to next target rather than exiting
+            continue
 
-    # 3) Update the file content on the work branch.
-    git.update_file_in_branch(work_branch, args.file_path, source_bytes)
-
-    # 4) Open a PR from work_branch -> target branch and print its URL.
-    pr_title = f"[SYNC] {args.file_path} from {args.source_file_branch} to {args.target_branch}"
-    pr_desc = (
-        f"Automated sync of {args.file_path}\n\n"
-        f"Source branch: {args.source_file_branch}\n"
-        f"Target: {args.target_branch}\n"
-        f"Time (UTC): {datetime.datetime.utcnow().isoformat()}Z"
-    )
-
-    pr_url = git.create_git_request(
-        source_branch_name=work_branch,
-        target_branch_name=args.target_branch,
-        title=pr_title,
-        description=pr_desc
-    )
-
-    print(pr_url)
-
-
-if __name__ == "__main__":
-    main()
-
-
-
-
-
---------
-
-
-
-
-def fetch_file_from_branch_rest(git: AzureGitConnector, file_path: str, branch_name: str, token: str) -> bytes:
-    """
-    Fetch raw file bytes from a given branch using the Items REST API with download=true.
-    This avoids any JSON decoding path and works for YAML or any text/binary file.
-    """
-    import base64
-    from urllib.parse import quote
-
-    org = git.organization_url.rstrip("/")
-    proj = git.project_name
-    repo_id = git.repository_id
-
-    encoded_path = quote(file_path, safe="/")
-    url = (
-        f"{org}/{proj}/_apis/git/repositories/{repo_id}/items"
-        f"?path={encoded_path}"
-        f"&versionType=branch&version={quote(branch_name)}"
-        f"&download=true"              # <— force raw bytes
-        f"&resolveLfs=true"
-        f"&api-version=7.1-preview.1"
-    )
-
-    hdr = {
-        "Authorization": "Basic " + base64.b64encode(f":{token}".encode()).decode(),
-        "Accept": "application/octet-stream",  # <— nudge server to send bytes
-    }
-
-    r = requests.get(url, headers=hdr)
-    if r.status_code != 200:
-        print(f"[ERROR] GET {url}\nStatus: {r.status_code}\nHeaders: {r.headers}\nBody (first 300): {r.text[:300]}", file=sys.stderr)
-        sys.exit(1)
-
-    return r.content
-
+    # Print PR URLs (one per line)
+    for url in pr_urls:
+        print(url)
