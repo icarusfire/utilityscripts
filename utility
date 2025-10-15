@@ -4,3 +4,21 @@
   /
   sum(kube_pod_container_resource_limits{cluster=~"$cluster",squad="xxxx",resource="cpu",unit="core"})
 )
+
+predict_linear(
+  (
+    100 *
+    sum(
+      kube_resourcequota{resource="requests.cpu", type="used"}
+        * on (namespace) group_left(label_squad)
+      kube_namespace_labels{label_squad="XX"}
+    )
+    /
+    sum(
+      kube_resourcequota{resource="requests.cpu", type="hard"}
+        * on (namespace) group_left(label_squad)
+      kube_namespace_labels{label_squad="XX"}
+    )
+  )[365d:],
+  31536000
+)
