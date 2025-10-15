@@ -6,19 +6,9 @@
 )
 
 predict_linear(
-  (
-    100 *
-    sum(
-      kube_resourcequota{resource="requests.cpu", type="used"}
-        * on (namespace) group_left(label_squad)
-      kube_namespace_labels{label_squad="XX"}
-    )
-    /
-    sum(
-      kube_resourcequota{resource="requests.cpu", type="hard"}
-        * on (namespace) group_left(label_squad)
-      kube_namespace_labels{label_squad="XX"}
-    )
+  sum by (cluster, squad) (
+    kube_resourcequota{cluster=~"$cluster", squad="$squad", resource="limits.cpu", type="used"}
   )[365d:],
   31536000
 )
+
