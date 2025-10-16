@@ -1,14 +1,7 @@
-100 *
-(
-  sum(rate(container_cpu_usage_seconds_total{cluster=~"$cluster",squad="xxxx",container!="",container!="POD"}[5m]))
-  /
-  sum(kube_pod_container_resource_limits{cluster=~"$cluster",squad="xxxx",resource="cpu",unit="core"})
+avg_over_time(
+  (
+    sum(rate(container_cpu_usage_seconds_total{cluster=~"$cluster",squad="OnePAM Platform",container!="",container!="POD"}[5m]))
+    /
+    sum(kube_pod_container_resource_requests{cluster=~"$cluster",squad="OnePAM Platform",resource="cpu"})
+  )[1w:5m]
 )
-
-predict_linear(
-  sum by (cluster, squad) (
-    kube_resourcequota{cluster=~"$cluster", squad="$squad", resource="limits.cpu", type="used"}
-  )[365d:],
-  31536000
-)
-
