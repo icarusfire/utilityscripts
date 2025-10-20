@@ -1,7 +1,31 @@
-avg_over_time(
-  (
-    sum(rate(container_cpu_usage_seconds_total{cluster=~"$cluster",squad="OnePAM Platform",container!="",container!="POD"}[5m]))
-    /
-    sum(kube_pod_container_resource_requests{cluster=~"$cluster",squad="OnePAM Platform",resource="cpu"})
-  )[1w:5m]
+avg( <BASE_EXPR> )
++ label_replace(
+    topk(1, sum by (service) (0 * (<BASE_EXPR>))),
+    "service","__summary__","service",".*"
+  )
+-------------------
+sum( <BASE_EXPR> )
++ label_replace(
+    topk(1, sum by (service) (0 * (<BASE_EXPR>))),
+    "service","__summary__","service",".*"
+  )
+---------------
+avg(
+  100 *
+  sum by (service) (rate(container_cpu_usage_seconds_total{cluster=~"$cluster",service!=""}[5m]))
+  /
+  sum by (service) (kube_pod_container_resource_requests{cluster=~"$cluster", resource="cpu"})
 )
++ label_replace(
+    topk(1,
+      sum by (service)(
+        0 * (
+          100 *
+          sum by (service) (rate(container_cpu_usage_seconds_total{cluster=~"$cluster",service!=""}[5m]))
+          /
+          sum by (service) (kube_pod_container_resource_requests{cluster=~"$cluster", resource="cpu"})
+        )
+      )
+    ),
+    "service","__summary__","service",".*"
+  )
