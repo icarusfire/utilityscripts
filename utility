@@ -1,1 +1,56 @@
 dummy file
+
+Write a Python refactoring script for a Java Maven multi-module repo migrated from Jackson 2 to Jackson 3.
+
+Problem:
+Some Java classes still use a legacy JSON Patch / JSON Merge Patch library that depends on Jackson 2, while the application now uses Jackson 3. This causes compile errors when Jackson 3 JsonNode values are passed to legacy APIs expecting Jackson 2 JsonNode.
+
+Goal:
+Create a conservative Python script that automatically refactors only the affected Java files.
+
+A Java file should be considered affected if it contains one or more of these:
+
+* imports or usages of com.github.fge.jsonpatch
+* JsonMergePatch
+* JsonPatch
+* JsonPatchException
+* both Jackson 3 imports/usages like tools.jackson.* and Jackson 2 imports/usages like com.fasterxml.jackson.*
+* compile-risk patterns such as mixed JsonNode usage or invalid duplicate Jackson exception multi-catch blocks
+
+Do not modify files that only use Jackson 3 normally and do not use the legacy patch library.
+
+Required refactoring approach:
+
+1. Create one compatibility adapter class if missing.
+2. The adapter must contain all direct legacy JSON Patch / JSON Merge Patch usage.
+3. The adapter may use Jackson 2 internally only for the legacy library.
+4. Normal application classes must not directly use the legacy patch library after refactoring.
+5. Normal application classes should delegate patch operations to the adapter.
+6. Preserve public method signatures where possible.
+7. Remove legacy patch imports from refactored application classes.
+8. Remove mixed Jackson 2 / Jackson 3 JsonNode usage from application classes.
+9. Fix obvious invalid multi-catch blocks involving duplicated or related Jackson exceptions.
+10. Skip files where the transformation is ambiguous.
+
+Script requirements:
+
+* Use pathlib, re, and normal file operations.
+* Run from repository root.
+* Support --dry-run.
+* Support --write.
+* Create .bak backups before changing files.
+* Print changed files.
+* Print skipped files with reasons.
+* Do not run Maven unless a separate optional flag is provided.
+* Do not include proprietary source code in the generated script.
+* Do not make broad unrelated formatting changes.
+
+Safety rules:
+
+* If a file uses JsonMergePatch, refactor it to call the adapter’s merge-patch method.
+* If a file uses JsonPatch, refactor it to call the adapter’s JSON-patch method.
+* Do not confuse JSON Merge Patch with JSON Patch; they are different formats.
+* If the script cannot confidently rewrite the method body, leave the file unchanged and report it.
+* Prefer partial safe automation over risky large rewrites.
+
+Generate the complete Python script.
