@@ -1,56 +1,535 @@
-dummy file
+The strongest upgrade is not adding another agent framework. Your explicit 10-phase pipeline is already a sensible architecture.
 
-Write a Python refactoring script for a Java Maven multi-module repo migrated from Jackson 2 to Jackson 3.
+What you need now is an evaluation-driven control layer around it:
 
-Problem:
-Some Java classes still use a legacy JSON Patch / JSON Merge Patch library that depends on Jackson 2, while the application now uses Jackson 3. This causes compile errors when Jackson 3 JsonNode values are passed to legacy APIs expecting Jackson 2 JsonNode.
+* Typed contracts between phases.
+* Repeatable benchmarks for every prompt/model combination.
+* Full traces rather than only aggregate token counts.
+* Automatic cheap-model routing with validation and fallback.
+* Deterministic verification of generated migrations.
 
-Goal:
-Create a conservative Python script that automatically refactors only the affected Java files.
+One terminology improvement: separate agent_profile from model. The agent defines instructions, tools and permissions; the model determines capability, speed and cost.
 
-A Java file should be considered affected if it contains one or more of these:
+Recommended stack
 
-* imports or usages of com.github.fge.jsonpatch
-* JsonMergePatch
-* JsonPatch
-* JsonPatchException
-* both Jackson 3 imports/usages like tools.jackson.* and Jackson 2 imports/usages like com.fasterxml.jackson.*
-* compile-risk patterns such as mixed JsonNode usage or invalid duplicate Jackson exception multi-catch blocks
+Priority	Technology	What it adds
+1	GitHub Copilot Python SDK	Replaces fragile subprocess/stdout handling
+2	Pydantic contracts	Machine-validatable phase outputs
+3	Promptfoo	Prompt/model A/B testing and CI regression tests
+4	OpenTelemetry + MLflow	Complete traces, prompt versions and experiment history
+5	Validation-based model router	Cheapest model that reliably passes
+6	Ragas/Docling	Better document ingestion and retrieval evaluation
+7	ast-grep/Tree-sitter/Hypothesis	Deterministic migration and stronger verification
+8	DSPy/GEPA	Automatic prompt optimization—after the eval dataset exists
 
-Do not modify files that only use Jackson 3 normally and do not use the legacy patch library.
+1. Replace the raw subprocess boundary
 
-Required refactoring approach:
+GitHub’s biggest recent change is directly relevant to your project: the Copilot SDK became generally available in June 2026. The Python package, github-copilot-sdk, controls the same runtime as Copilot CLI through JSON-RPC. It handles runtime compatibility, sessions, streaming events, tools, permissions, hooks and OpenTelemetry. ⁠￼
 
-1. Create one compatibility adapter class if missing.
-2. The adapter must contain all direct legacy JSON Patch / JSON Merge Patch usage.
-3. The adapter may use Jackson 2 internally only for the legacy library.
-4. Normal application classes must not directly use the legacy patch library after refactoring.
-5. Normal application classes should delegate patch operations to the adapter.
-6. Preserve public method signatures where possible.
-7. Remove legacy patch imports from refactored application classes.
-8. Remove mixed Jackson 2 / Jackson 3 JsonNode usage from application classes.
-9. Fix obvious invalid multi-catch blocks involving duplicated or related Jackson exceptions.
-10. Skip files where the transformation is ambiguous.
+Keep your orchestration and introduce an adapter:
 
-Script requirements:
+class AgentBackend(Protocol):
+    async def run_phase(
+        self,
+        phase: PhaseSpec,
+        inputs: dict,
+    ) -> PhaseResult: ...
 
-* Use pathlib, re, and normal file operations.
-* Run from repository root.
-* Support --dry-run.
-* Support --write.
-* Create .bak backups before changing files.
-* Print changed files.
-* Print skipped files with reasons.
-* Do not run Maven unless a separate optional flag is provided.
-* Do not include proprietary source code in the generated script.
-* Do not make broad unrelated formatting changes.
+Initially implement CopilotSdkBackend; retain your subprocess implementation temporarily as a fallback. This prevents GitHub-specific details from leaking into the orchestration.
 
-Safety rules:
+The SDK exposes per-model-call:
 
-* If a file uses JsonMergePatch, refactor it to call the adapter’s merge-patch method.
-* If a file uses JsonPatch, refactor it to call the adapter’s JSON-patch method.
-* Do not confuse JSON Merge Patch with JSON Patch; they are different formats.
-* If the script cannot confidently rewrite the method body, leave the file unchanged and report it.
-* Prefer partial safe automation over risky large rewrites.
+* Input, output, reasoning and cached tokens.
+* Duration.
+* Premium-request cost.
+* Subagent attribution.
+* Context-window utilization.
+* Session-level AI-credit limits.
 
-Generate the complete Python script.
+That is much more accurate than parsing the final CLI statistics. The live usage events are ephemeral, so persist them when received. ⁠￼
+
+2. Turn every phase boundary into a contract
+
+Do not let one phase pass an arbitrary Markdown essay to the next phase. Define Pydantic models such as:
+
+class Evidence(BaseModel):
+    source_id: str
+    location: str
+    content_hash: str
+class MigrationRequirement(BaseModel):
+    requirement_id: str
+    description: str
+    evidence: list[Evidence]
+    confidence: float
+class MigrationPlan(BaseModel):
+    requirements: list[MigrationRequirement]
+    operations: list[MigrationOperation]
+    validation_commands: list[str]
+    expected_changed_files: list[str]
+
+With the Copilot SDK, you can expose something like submit_phase_result as a typed custom tool generated from a Pydantic model. The agent must call it once; your Python code validates the arguments.
+
+If validation fails:
+
+1. Return the exact validation errors.
+2. Retry once using the same model.
+3. If it still fails, use the stronger fallback model.
+4. Stop rather than silently passing malformed output downstream.
+
+This will improve reliability more than almost any fashionable orchestration library.
+
+3. Add a real prompt/model benchmark with Promptfoo
+
+Promptfoo is the most immediately applicable open-source tool for your “which prompt or model actually succeeds?” question. It can compare prompts and models across a test matrix, use deterministic or LLM-based assertions, cache results, run concurrently and fail CI on regressions. Most importantly, its custom Python provider can invoke your existing phase runner or entire migration pipeline. ⁠￼
+
+Build a golden dataset of approximately 30–50 representative migrations:
+
+* Straightforward migration.
+* Missing or contradictory documentation.
+* Large repository.
+* Already partially migrated.
+* Deprecated APIs.
+* Generated code.
+* Unsupported constructs.
+* Cases from actual previous failures.
+
+For each candidate, record:
+
+Metric	Purpose
+Hard success	Build and tests pass
+Requirement coverage	All required changes implemented
+Unsupported claims	Summary stays grounded in documents
+Idempotence	Second migration produces no additional diff
+Unwanted changes	Files outside the expected scope
+Tokens/credits	Cost
+Wall time/p95 latency	Speed
+Retry rate	Operational reliability
+
+Run nondeterministic candidates several times. A model scoring 19/20 once is not necessarily more reliable than one scoring 56/60.
+
+Most importantly, do not create one weighted score where low latency can compensate for incorrect code. Use:
+
+1. Hard correctness threshold.
+2. Then minimize cost.
+3. Then minimize latency.
+
+4. Add end-to-end tracing
+
+Use one root span per migration and one child span per phase. Record:
+
+phase
+agent_profile
+model_id
+prompt_version
+prompt_hash
+input_hash
+document_snapshot_hash
+repository_commit
+attempt
+tokens_in/out
+cached_tokens
+premium_cost
+latency
+validator_results
+changed_file_count
+final_status
+
+My default choice would be self-hosted MLflow 3.x. It accepts OpenTelemetry traces over OTLP, provides prompt versioning, datasets, evaluation experiments and prompt comparison. Its prompt-evaluation UI can compare prompt versions across models and datasets. ⁠￼
+
+Langfuse is the main alternative if you prefer a more agent-specific interface; it combines traces, prompt management, datasets, experiments and online/offline evaluation. Do not deploy MLflow, Langfuse and Phoenix together initially—the overlap is substantial. ⁠￼
+
+For bank repositories, disable content capture by default. Store hashes and operational metadata, then enable prompt/output capture only in a sanitized evaluation environment.
+
+5. Make model selection empirical
+
+Your config can evolve toward:
+
+phases:
+  create_migration_plan:
+    agent_profile: migration-planner
+    prompt: migration-planner@v7
+    model_policy:
+      candidates: [cheap, balanced]
+      fallback: strong
+      minimum_pass_rate: 0.98
+    output_contract: MigrationPlan
+    validators:
+      - schema
+      - requirement_coverage
+      - source_grounding
+
+Routing policy:
+
+* Select the cheapest model whose measured reliability meets the phase threshold.
+* On a validation failure, retry with the failure information.
+* Escalate to the stronger model only if necessary.
+* Evaluate new models in shadow benchmark runs before routing real work to them.
+* Keep logical aliases such as cheap, balanced, and strong, but record the resolved model ID.
+
+This transforms model selection from opinion into measured policy.
+
+6. Improve the document phase separately
+
+If your documents include PDF, DOCX, PowerPoint or complex HTML, Docling is worth testing. It runs locally and converts these formats into structured Markdown/JSON while retaining headings, reading order and tables. ⁠￼
+
+For retrieval:
+
+* Combine lexical search/BM25 with embeddings.
+* Rerank the top results with a cross-encoder.
+* Preserve source location and content hash in every extracted requirement.
+* Evaluate retrieval separately from summarization.
+
+Ragas provides context precision, context recall and agent/RAG-oriented metrics, but only add it if your “fetch documents” phase is genuinely doing retrieval. ⁠￼
+
+7. Make the migration less dependent on generated free-form code
+
+Where possible:
+
+* Let the LLM identify transformations and generate rules.
+* Apply repeatable transformations using ast-grep, Tree-sitter or a language-specific codemod library.
+* Use the LLM for exceptional cases that cannot be expressed structurally.
+
+ast-grep provides polyglot AST-aware searching and rewriting; Tree-sitter provides parsers across many languages. Hypothesis can generate edge cases and shrink failures to minimal examples. ⁠￼
+
+Your final code gate should ideally include:
+
+* Compilation.
+* Existing tests.
+* Migration-specific contract tests.
+* Static analysis.
+* Forbidden-pattern scan.
+* Idempotence test.
+* Source-versus-target behavioural comparison where feasible.
+
+8. Automatic prompt optimization comes last
+
+Once the benchmark and metrics are trustworthy, experiment with DSPy’s MIPROv2 or GEPA. These generate alternative instructions/few-shot examples and optimize them against your metric. MLflow also exposes GEPA-based prompt optimization. ⁠￼
+
+Do not start here. Without a representative dataset and reliable metric, an optimizer merely learns to exploit weaknesses in your evaluator.
+
+My concrete implementation order would be:
+
+1. Copilot SDK adapter.
+2. Pydantic phase contracts.
+3. OpenTelemetry phase traces.
+4. Golden migration dataset and Promptfoo matrix.
+5. Validation-triggered model fallback.
+6. Exact content-addressed caching.
+7. Retrieval evaluation and structural codemods.
+8. GEPA/DSPy experimentation.
+
+I would not add LangGraph merely to make the project appear more agentic. Your workflow is largely deterministic and phase-based; explicit Python remains easier to test. Add Temporal only if migrations must survive process crashes, machine restarts or multi-hour distributed execution.
+
+If useful, I can set up “Monitor Copilot SDK and model changes” so CLI/SDK or model retirements do not unexpectedly break the pipeline. Monitor Copilot SDK and model changes
+
+
+--------
+
+
+OpenRewrite is out. Given that constraint, the best design is:
+
+Do not ask Copilot to generate an entire standalone Python migration program from scratch. Ask it to generate migration rules against a stable, hand-written transformation runtime.
+
+That changes the task from “invent a reliable codemod framework every time” to “fill in the migration-specific logic.”
+
+Proposed architecture
+
+flowchart TD
+    A["Requirements + real Java usages"] --> B["Frozen before/after tests"]
+    B --> C["Generate migration rules"]
+    C --> D["Stable Python transformation runtime"]
+    D --> E["Parse, compile and idempotence gates"]
+    E -- "Structured failures" --> C
+
+1. Build one reliable Python migration runtime
+
+You write and thoroughly test this once. Generated code uses its API.
+
+The runtime should own:
+
+* Repository and module discovery.
+* Candidate-file selection.
+* Java parsing.
+* Import addition/removal.
+* Byte-offset edit handling.
+* Overlapping-edit detection.
+* Atomic file replacement.
+* Dry-run/diff generation.
+* Formatting.
+* Validation and reporting.
+* Rollback/worktree handling.
+
+Generated code should contain only migration-specific rules:
+
+class MigrateOldClient(MigrationRule):
+    candidate_symbols = {
+        "com.example.OldClient",
+        "OldClient.builder",
+    }
+    def match(self, node: JavaNode, context: JavaContext) -> Match | None:
+        ...
+    def transform(self, match: Match) -> list[Edit]:
+        ...
+
+This eliminates repeated LLM mistakes involving directory walking, encodings, regex escaping, imports, write ordering and subprocess handling.
+
+2. Use Tree-sitter instead of text matching
+
+A fast Python-native combination would be:
+
+tree-sitter
+tree-sitter-java
+ast-grep-py    # optionally, for easier structural patterns
+
+Tree-sitter provides a concrete syntax tree, tolerates incomplete code and has official Python bindings. ast-grep-py adds a convenient structural pattern API over syntax trees. 
+
+For performance on the huge repository:
+
+1. Use rg to find files containing candidate symbols.
+2. Parse only those files with Tree-sitter.
+3. Apply edits from highest byte offset to lowest.
+4. Reject overlapping edits.
+5. Reparse only changed files.
+6. Compile only affected modules.
+
+Do not parse the entire repository when migrating one library.
+
+Important limitation
+
+Tree-sitter understands Java syntax, but it does not fully resolve Java types. Therefore, your runtime should support increasingly expensive confidence levels:
+
+Level	Example	Behaviour
+Exact	Fully qualified type or unique import	Automatically transform
+Structural	Recognizable builder chain with local evidence	Transform and validate
+Local flow	Builder assigned to a variable within one method	Track within that method
+Ambiguous	Same class name from multiple packages	Skip and report
+Interprocedural	Builder passed between methods/classes	Skip unless a specialist rule handles it
+
+Trying to “support everything” is how a migration script becomes dangerous. A robust tool should deliberately refuse uncertain transformations.
+
+3. Mine actual code patterns before generating the script
+
+This is probably the single best way to reduce those ten human iterations.
+
+Before code generation, add a usage-analysis phase:
+
+1. Find all possible usages of the old API.
+2. Parse them structurally.
+3. Normalize their AST shapes.
+4. Cluster equivalent shapes.
+5. Put representative examples from every cluster into the generation prompt.
+
+For example, the scanner might discover:
+
+Cluster A: Foo.builder().a(x).b(y).build()       1,842 occurrences
+Cluster B: Foo.builder().a(x).build()              216 occurrences
+Cluster C: builder stored in local variable         73 occurrences
+Cluster D: conditional builder invocation           19 occurrences
+Cluster E: unresolved/ambiguous                      8 occurrences
+
+Now Copilot is not guessing possible builder variations. It sees what developers actually wrote.
+
+Normalization can ignore variable names, literals, whitespace and comments while retaining:
+
+* Method names.
+* Argument counts and expression kinds.
+* Builder-chain order.
+* Assignment versus inline use.
+* Conditional placement.
+* Relevant import/FQN information.
+
+Your coverage measurement then becomes concrete:
+
+2,158 candidates
+2,131 safely transformed
+12 already migrated
+8 skipped as ambiguous
+7 unsupported local-flow variants
+
+That is far more meaningful than “the script completed successfully.”
+
+4. Generate frozen tests before generating implementation
+
+Split the current code-generation phase:
+
+Requirements
+    ↓
+Generate tests and edge cases
+    ↓
+Freeze tests
+    ↓
+Generate transformer
+    ↓
+Execute tests
+    ↓
+Repair transformer only
+
+The implementation agent must not be allowed to modify the expected results after generation. Otherwise, it may “solve” failures by weakening its own tests.
+
+Use three fixture categories.
+
+Positive fixtures
+
+Input must be transformed into a precise expected output:
+
+// before
+OldClient.builder()
+    .endpoint(url)
+    .timeout(timeout)
+    .build();
+// expected
+NewClient.builder()
+    .baseUrl(url)
+    .requestTimeout(timeout)
+    .build();
+
+Negative fixtures
+
+These must remain unchanged:
+
+* Unrelated builder with the same method names.
+* Same simple class name from another package.
+* Already-migrated code.
+* Comment or string containing the old API name.
+* Test fixture intentionally using the old version.
+* Generated or excluded source directory.
+
+Variation fixtures
+
+Generate variants for:
+
+* Missing optional builder calls.
+* Calls in a different order.
+* Extra unknown builder calls.
+* Static imports.
+* Fully qualified usage.
+* Nested expressions.
+* Arguments that are expressions rather than literals.
+* Multiline calls and comments inside chains.
+* Generic types.
+* Lambdas and anonymous classes.
+* Builder stored in a local variable.
+* Multiple transformations in one file.
+
+Your existing OpenRewrite recipe requirements and their before/after examples can seed these tests without executing OpenRewrite.
+
+5. Make builder transformations structural
+
+Do not match the entire builder expression as one fixed pattern.
+
+Parse the builder as a sequence:
+
+BuilderChain(
+    factory="OldClient.builder",
+    operations=[
+        Call("endpoint", [url_expression]),
+        Call("timeout", [timeout_expression]),
+    ],
+    terminal=Call("build", []),
+)
+
+The transformer can then:
+
+* Rename individual operations.
+* Preserve unknown operations.
+* Handle absent optional calls.
+* Reorder only when required.
+* Reuse original argument AST text.
+* Add required calls only when their values can be derived.
+* Reject duplicate or ambiguous calls.
+
+For the “missing parameter” case: if the missing value is optional, preserve the omission. If the new API requires a value that cannot be derived, do not invent one—emit a structured manual-action record.
+
+{
+  "file": "src/main/java/example/Config.java",
+  "line": 84,
+  "rule": "migrate-old-client",
+  "status": "skipped",
+  "reason": "New API requires retryPolicy; no equivalent value was found"
+}
+
+6. Add an automatic generate–test–repair loop
+
+The code-generation phase should produce a candidate, but the phase does not pass until deterministic validators accept it.
+
+Recommended gates:
+
+1. Generated Python passes ruff and mypy.
+2. Transformer unit tests pass.
+3. Fixture before/after tests pass.
+4. Negative fixtures remain byte-for-byte unchanged.
+5. Changed Java files parse without Tree-sitter error nodes.
+6. Changed modules compile.
+7. Relevant Java tests pass.
+8. Running the migration a second time produces an empty diff.
+9. No old API usages remain except explicitly skipped locations.
+10. Changes remain within permitted files/modules.
+
+When a gate fails, feed Copilot structured information:
+
+{
+  "gate": "java_compile",
+  "file": "OrderConfig.java",
+  "diagnostic": "cannot find symbol: method requestTimeout(Duration)",
+  "related_rule": "migrate-client-builder",
+  "fixture_tests_passed": 17,
+  "fixture_tests_failed": 2
+}
+
+Then regenerate or patch only the rule implementation. Limit this to perhaps three repair rounds; after that, report the unsupported pattern rather than looping indefinitely.
+
+Use the strongest model for this phase and cheaper models for documentation extraction and summarization. This is the phase where additional reasoning capability has direct financial value.
+
+7. Add invariants, not just example tests
+
+These catch unexpected edge cases:
+
+* Idempotence: migrate(migrate(source)) == migrate(source).
+* No-op safety: source without target patterns is unchanged.
+* Parse preservation: changed output always parses.
+* Locality: only matched AST ranges and imports may change.
+* Determinism: identical input produces identical output.
+* Comment preservation: comments outside replaced nodes remain.
+* Encoding preservation: UTF-8/BOM and line-ending policy are respected.
+* Scope restriction: excluded/generated directories are untouched.
+
+Hypothesis can generate builder-chain combinations and shrink a failure to the smallest reproducible case. 
+
+For example, generate chains with optional, duplicated, reordered and unknown calls, then assert parseability, determinism and idempotence.
+
+8. Validate efficiently on the huge repository
+
+A full repository build after every repair iteration would recreate the performance problem you dislike.
+
+Use validation levels:
+
+* Every repair iteration: Python tests, fixtures and Java parsing.
+* Promising candidate: compile affected Maven/Gradle modules.
+* Final candidate: targeted tests plus broader repository validation.
+* CI: complete authoritative build.
+
+Determine affected modules from the changed files:
+
+* Maven: nearest pom.xml, then something equivalent to -pl module -am.
+* Gradle: affected subproject’s compileJava and targeted tests.
+* Format only changed files or changed ranges using the project’s existing formatter.
+
+Google Java Format can format particular files, line ranges or byte offsets, though you should use whatever formatter the repository already standardizes on. 
+
+What I would implement first
+
+The highest-value first version is:
+
+1. A stable migration_runtime package.
+2. rg candidate filtering.
+3. tree-sitter-java parsing.
+4. AST-shape inventory and clustering.
+5. Frozen positive/negative fixture generation.
+6. Generated rule code against the runtime.
+7. Automated parse, compile and idempotence gates.
+8. Structured repair feedback.
+9. A final transformed/skipped/unsupported report.
+
+That would materially change the nature of your tool. Instead of “Copilot writes a Python script that looks plausible,” it becomes “Copilot proposes a transformation plugin that must satisfy an executable specification before anyone receives it.”
+
+
